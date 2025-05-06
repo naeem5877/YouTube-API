@@ -4,7 +4,7 @@ import os
 import uuid
 import threading
 import time
-import json
+import shutil
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -14,6 +14,9 @@ DOWNLOAD_FOLDER = os.path.join(os.getcwd(), "downloads")
 COOKIE_FILE = os.path.join(os.getcwd(), "cookie.txt")
 TEMP_FOLDER = os.path.join(os.getcwd(), "temp")
 
+# Define yt-dlp version to use
+YTDLP_VERSION = '2025.4.30'
+
 # Create necessary directories
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(TEMP_FOLDER, exist_ok=True)
@@ -22,30 +25,56 @@ os.makedirs(TEMP_FOLDER, exist_ok=True)
 downloads_in_progress = {}
 completed_downloads = {}
 
-# Function to clean up old files periodically (reduced frequency for Koyeb)
+# Function to clean up old files periodically
 def cleanup_old_files():
     while True:
         now = time.time()
-        # Delete files older than 30 minutes to save space on Koyeb
+        
+        # Keep track of which users are downloading
+        active_download_ids = set(downloads_in_progress.keys())
+        active_file_paths = set()
+        
+        # Collect all active file paths to avoid deleting in-use files
+        for download_id in active_download_ids:
+            info = downloads_in_progress.get(download_id, {})
+            temp_path = os.path.join(TEMP_FOLDER, f"{download_id}_*")
+            active_file_paths.add(temp_path)
+        
+        # Check completed downloads and remove old ones
+        to_remove = []
+        for download_id, info in completed_downloads.items():
+            # Only delete files that are no longer active and older than 30 minutes
+            if download_id not in active_download_ids and now - info.get("completion_time", 0) > 1800:  # 30 minutes
+                file_path = info.get("file_path")
+                if file_path and os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                        print(f"Cleaned up completed download: {file_path}")
+                    except Exception as e:
+                        print(f"Error deleting {file_path}: {e}")
+                to_remove.append(download_id)
+
+        # Remove tracked completed downloads
+        for download_id in to_remove:
+            completed_downloads.pop(download_id, None)
+            
+        # Delete old files in download folder (older than 30 minutes)
         for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
             for filename in os.listdir(folder):
                 file_path = os.path.join(folder, filename)
+                
+                # Skip files that are currently being used
+                if any(file_path.startswith(active_path) for active_path in active_file_paths):
+                    continue
+                    
                 if os.path.isfile(file_path) and now - os.path.getmtime(file_path) > 1800:  # 30 minutes
                     try:
                         os.remove(file_path)
+                        print(f"Cleaned up old file: {file_path}")
                     except Exception as e:
                         print(f"Error deleting {file_path}: {e}")
 
-        # Clean up completed downloads dictionary
-        to_remove = []
-        for download_id, info in completed_downloads.items():
-            if now - info.get("completion_time", 0) > 1800:  # 30 minutes
-                to_remove.append(download_id)
-
-        for download_id in to_remove:
-            completed_downloads.pop(download_id, None)
-
-        time.sleep(3600)  # Check every hour
+        time.sleep(300)  # Check every 5 minutes
 
 # Start cleanup thread
 cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
@@ -64,41 +93,51 @@ def get_base_ydl_opts():
 
     return ydl_opts
 
-def get_verification_status(info_dict):
-    """Improved check if channel is verified based on badges or other indicators"""
-    # Check different possible locations for verification status
-    if info_dict.get('verified', False):
+def get_verification_status(info):
+    """Check if channel is verified based on channel data"""
+    # Check for channel verification badges in different possible locations
+    if info.get('channel_is_verified'):
         return True
-    
-    # Check channel badges if available
-    badges = info_dict.get('badges', [])
-    if badges:
-        for badge in badges:
-            if badge and isinstance(badge, dict) and 'verified' in str(badge).lower():
+
+    # Check in channel badges if available
+    badges = info.get('badges', [])
+    for badge in badges:
+        if badge and isinstance(badge, dict):
+            badge_type = badge.get('type', '').lower()
+            if 'verified' in badge_type or 'official' in badge_type:
                 return True
-    
-    # Check for verification in channel name or description
-    channel_name = info_dict.get('channel', info_dict.get('uploader', ''))
-    if channel_name and '✓' in channel_name:
-        return True
-        
+
+    # Check in uploader badges if available
+    uploader_badges = info.get('uploader_badges', [])
+    if isinstance(uploader_badges, list):
+        for badge in uploader_badges:
+            if badge and isinstance(badge, str) and ('verified' in badge.lower() or 'official' in badge.lower()):
+                return True
+
     return False
 
-def get_subscriber_count(info_dict):
-    """Extract subscriber count from channel information"""
-    # Try different possible locations for subscriber count
-    subscriber_count = info_dict.get('channel_follower_count')
+def get_channel_profile_picture(info):
+    """Extract channel profile picture from video info"""
+    # Try multiple possible locations for channel avatar
     
-    if not subscriber_count:
-        subscriber_count = info_dict.get('subscriber_count')
-    
-    # Some versions report it under channel_is_subscribed
-    if not subscriber_count:
-        channel_info = info_dict.get('channel')
-        if isinstance(channel_info, dict):
-            subscriber_count = channel_info.get('subscriber_count')
-    
-    return subscriber_count
+    # Check in channel thumbnails
+    if info.get('channel_thumbnails'):
+        for thumbnail in info.get('channel_thumbnails', []):
+            if thumbnail and isinstance(thumbnail, dict) and 'url' in thumbnail:
+                return thumbnail['url']
+
+    # Look for uploader_thumbnail
+    if info.get('uploader_thumbnail'):
+        return info.get('uploader_thumbnail')
+
+    # Check regular thumbnails for avatar
+    for thumbnail in info.get('thumbnails', []):
+        if thumbnail and isinstance(thumbnail, dict):
+            thumbnail_id = thumbnail.get('id', '')
+            if isinstance(thumbnail_id, str) and ('avatar' in thumbnail_id or 'channel' in thumbnail_id):
+                return thumbnail['url']
+
+    return None
 
 @app.route('/api/video-info', methods=['GET'])
 def get_video_info():
@@ -109,59 +148,87 @@ def get_video_info():
     - url: YouTube video URL
 
     Returns:
-    - Video information including title, thumbnail, channel info, and available formats with direct download links
+    - Video information including title, thumbnails, channel info, and available formats
     """
     url = request.args.get('url')
     if not url:
         return jsonify({"error": "Missing video URL"}), 400
 
     try:
+        # Ensure we're using the specified yt-dlp version
         ydl_opts = get_base_ydl_opts()
-        ydl_opts.update({
-            'extract_flat': False,  # We need full info to get subscribers
-            'skip_download': True,
-        })
+        ydl_opts['extract_flat'] = False  # Ensure we get full info
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Extract full info with formats
             info = ydl.extract_info(url, download=False)
+
+            if not info:
+                return jsonify({"error": "Could not extract video information"}), 500
+
             video_id = info.get('id')
+
+            # Get clean title
+            title = info.get('title', '').strip()
+            if not title:
+                title = info.get('fulltitle', '').strip()
+
+            # Get only 4 high quality thumbnails
+            thumbnails = info.get('thumbnails', [])
+            selected_thumbnails = []
+            
+            if thumbnails:
+                # Sort thumbnails by resolution (if width/height available)
+                sorted_thumbnails = sorted(
+                    [t for t in thumbnails if t.get('width') and t.get('height')],
+                    key=lambda x: (x.get('width', 0) * x.get('height', 0)),
+                    reverse=True
+                )
+                
+                # Take top 4 thumbnails
+                selected_thumbnails = sorted_thumbnails[:4]
+                
+                # If fewer than 4 sorted thumbnails, add others until we have 4
+                if len(selected_thumbnails) < 4 and len(thumbnails) > len(selected_thumbnails):
+                    for t in thumbnails:
+                        if t not in selected_thumbnails:
+                            selected_thumbnails.append(t)
+                            if len(selected_thumbnails) >= 4:
+                                break
 
             # Extract relevant information
             result = {
                 "id": video_id,
-                "title": info.get('title'),
+                "title": title,
                 "description": info.get('description'),
                 "duration": info.get('duration'),
                 "view_count": info.get('view_count'),
                 "like_count": info.get('like_count'),
                 "upload_date": info.get('upload_date'),
-                "thumbnails": info.get('thumbnails', []),
+                "thumbnails": selected_thumbnails,
                 "channel": {
                     "id": info.get('channel_id'),
                     "name": info.get('channel', info.get('uploader')),
                     "url": info.get('channel_url'),
-                    "profile_picture": None,  # Will be updated if available
-                    "verified": get_verification_status(info),
-                    "subscriber_count": get_subscriber_count(info)
+                    "profile_picture": get_channel_profile_picture(info),
+                    "verified": get_verification_status(info)
                 },
                 "audio_formats": [],
                 "video_formats": []
             }
 
-            # Try to extract channel profile picture if available
-            for thumbnail in info.get('thumbnails', []):
-                if 'url' in thumbnail and ('avatar' in thumbnail.get('id', '') or 'avatar' in thumbnail.get('url', '')):
-                    result['channel']['profile_picture'] = thumbnail['url']
-                    break
-
             # Extract audio formats
             audio_formats = []
             for format in info.get('formats', []):
                 if format.get('vcodec') == 'none' and format.get('acodec') != 'none':
+                    # Skip formats with no filesize information
+                    if not format.get('filesize') and not format.get('filesize_approx'):
+                        continue
+
                     audio_formats.append({
                         "format_id": format.get('format_id'),
                         "ext": format.get('ext'),
-                        "filesize": format.get('filesize'),
+                        "filesize": format.get('filesize') or format.get('filesize_approx'),
                         "format_note": format.get('format_note'),
                         "abr": format.get('abr'),
                         "download_url": f"/api/direct-download/{video_id}/{format.get('format_id')}"
@@ -169,14 +236,22 @@ def get_video_info():
 
             result["audio_formats"] = audio_formats
 
-            # Extract video formats with direct download links
+            # Extract only available video formats with direct download links
             video_formats = []
             for format in info.get('formats', []):
                 if format.get('vcodec') != 'none':
+                    # Skip formats with no filesize information
+                    if not format.get('filesize') and not format.get('filesize_approx'):
+                        continue
+
+                    # Skip formats that are likely unavailable
+                    if format.get('format_note', '').lower() == 'none':
+                        continue
+
                     video_formats.append({
                         "format_id": format.get('format_id'),
                         "ext": format.get('ext'),
-                        "filesize": format.get('filesize'),
+                        "filesize": format.get('filesize') or format.get('filesize_approx'),
                         "format_note": format.get('format_note'),
                         "width": format.get('width'),
                         "height": format.get('height'),
@@ -240,22 +315,8 @@ def process_download(download_id, url, format_id=None, audio_id=None):
     }
 
     try:
-        # First get video info to use title in filename
-        ydl_opts = get_base_ydl_opts()
-        ydl_opts.update({
-            'quiet': True,
-            'skip_download': True,
-        })
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            video_title = info.get('title', 'video')
-            # Clean title for safe filename
-            video_title = ''.join(c for c in video_title if c.isalnum() or c in ' ._-')
-            video_title = video_title.strip()
-            
-        output_filename = f"VibeDownloader - {video_title}.mp4"
-        output_path = os.path.join(DOWNLOAD_FOLDER, f"{download_id}_{output_filename}")
+        output_filename = f"{download_id}.mp4"
+        output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
 
         # Configure yt-dlp options
         ydl_opts = get_base_ydl_opts()
@@ -294,9 +355,9 @@ def process_download(download_id, url, format_id=None, audio_id=None):
 
                     # Move to downloads folder with proper name
                     if downloaded_file and os.path.exists(downloaded_file):
-                        os.rename(downloaded_file, output_path)
+                        shutil.move(downloaded_file, output_path)
                     elif downloaded_file and os.path.exists(downloaded_file.rsplit(".", 1)[0] + ".mp4"):
-                        os.rename(downloaded_file.rsplit(".", 1)[0] + ".mp4", output_path)
+                        shutil.move(downloaded_file.rsplit(".", 1)[0] + ".mp4", output_path)
         else:
             # Download best quality and merge
             ydl_opts.update({
@@ -310,9 +371,9 @@ def process_download(download_id, url, format_id=None, audio_id=None):
 
                 # Move to downloads folder with proper name
                 if downloaded_file and os.path.exists(downloaded_file):
-                    os.rename(downloaded_file, output_path)
+                    shutil.move(downloaded_file, output_path)
                 elif downloaded_file and os.path.exists(downloaded_file.rsplit(".", 1)[0] + ".mp4"):
-                    os.rename(downloaded_file.rsplit(".", 1)[0] + ".mp4", output_path)
+                    shutil.move(downloaded_file.rsplit(".", 1)[0] + ".mp4", output_path)
 
         # Update download info
         completed_downloads[download_id] = {
@@ -320,7 +381,6 @@ def process_download(download_id, url, format_id=None, audio_id=None):
             "url": url,
             "file_path": output_path,
             "download_url": f"/api/get-file/{download_id}",
-            "filename": output_filename,
             "completion_time": time.time()
         }
 
@@ -387,7 +447,13 @@ def update_progress(download_id, d):
             try:
                 downloads_in_progress[download_id]['progress'] = float(d.get('_percent_str', '0%').replace('%', ''))
             except:
-                pass
+                # Use the newer progress format in case _percent_str is not available
+                try:
+                    if d.get('total_bytes') and d.get('downloaded_bytes'):
+                        progress = (d.get('downloaded_bytes') / d.get('total_bytes')) * 100
+                        downloads_in_progress[download_id]['progress'] = progress
+                except:
+                    pass
         elif d['status'] == 'finished':
             downloads_in_progress[download_id]['status'] = 'processing'
             downloads_in_progress[download_id]['progress'] = 100
@@ -418,8 +484,7 @@ def check_download_status(download_id):
             "download_id": download_id,
             "status": completed_downloads[download_id]["status"],
             "url": completed_downloads[download_id]["url"],
-            "download_url": completed_downloads[download_id].get("download_url"),
-            "filename": completed_downloads[download_id].get("filename")
+            "download_url": completed_downloads[download_id].get("download_url")
         })
 
     return jsonify({"error": "Download ID not found"}), 404
@@ -439,7 +504,7 @@ def get_downloaded_file(download_id):
         file_path = completed_downloads[download_id]["file_path"]
 
         if os.path.exists(file_path):
-            filename = completed_downloads[download_id].get("filename", "download.mp4")
+            filename = os.path.basename(file_path)
             return send_file(file_path, as_attachment=True, download_name=filename)
 
     return jsonify({"error": "File not found"}), 404
@@ -466,34 +531,16 @@ def direct_download(video_id, format_id):
 
     try:
         # Create a unique filename based on video ID and format
-        cache_filename = f"{video_id}_{format_id}"
+        filename = f"{video_id}_{format_id}"
         if audio_id:
-            cache_filename += f"_{audio_id}"
-        cache_filename += ".mp4"
+            filename += f"_{audio_id}"
+        filename += ".mp4"
 
-        output_path = os.path.join(DOWNLOAD_FOLDER, cache_filename)
-
-        # First get video info for better filename
-        ydl_opts = get_base_ydl_opts()
-        ydl_opts.update({
-            'quiet': True,
-            'skip_download': True,
-        })
-        
-        video_title = ""
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
-                video_title = info.get('title', '')
-                # Clean title for safe filename
-                video_title = ''.join(c for c in video_title if c.isalnum() or c in ' ._-')
-                video_title = video_title.strip()
-            except:
-                video_title = video_id
+        output_path = os.path.join(DOWNLOAD_FOLDER, filename)
 
         # Check if file already exists (cached)
         if os.path.exists(output_path):
-            download_name = custom_filename if custom_filename else f"VibeDownloader - {video_title}.mp4"
+            download_name = custom_filename if custom_filename else f"{video_id}.mp4"
             return send_file(output_path, as_attachment=True, download_name=download_name)
 
         # Set up download options
@@ -525,10 +572,16 @@ def direct_download(video_id, format_id):
 
         # Download the file
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url)
+            info = ydl.extract_info(url)
 
-        # Get a user-friendly filename
-        download_name = custom_filename if custom_filename else f"VibeDownloader - {video_title}.mp4"
+            # Get the actual title for a better filename if not provided
+            if not custom_filename and info.get('title'):
+                video_title = info.get('title')
+                # Clean the title for use as a filename
+                video_title = ''.join(c for c in video_title if c.isalnum() or c in ' ._-')
+                download_name = f"{video_title}.mp4"
+            else:
+                download_name = custom_filename if custom_filename else f"{video_id}.mp4"
 
         # Update downloads info and remove from in-progress
         if download_id in downloads_in_progress:
@@ -538,7 +591,6 @@ def direct_download(video_id, format_id):
             "status": "completed",
             "url": url,
             "file_path": output_path,
-            "filename": download_name,
             "completion_time": time.time()
         }
 
@@ -551,118 +603,34 @@ def direct_download(video_id, format_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/upload-cookie', methods=['POST'])
-def upload_cookie():
-    """
-    Upload cookie.txt file
-
-    Form data:
-    - cookie_file: The cookie.txt file
-
-    Returns:
-    - Success or error message
-    """
-    if 'cookie_file' not in request.files:
-        return jsonify({"error": "No file part"}), 400
-
-    file = request.files['cookie_file']
-
-    if file.filename == '':
-        return jsonify({"error": "No selected file"}), 400
-
-    try:
-        filename = secure_filename(file.filename)
-        file_path = os.path.join(os.getcwd(), "cookie.txt")
-        file.save(file_path)
-        return jsonify({"success": True, "message": "Cookie file uploaded successfully"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/cookie.txt', methods=['GET'])
-def get_cookie_file():
-    """
-    Return cookie.txt file content or empty placeholder if not exists
-    Used to allow client-side checking if cookie file is present
-    """
-    if os.path.exists(COOKIE_FILE):
-        with open(COOKIE_FILE, 'r') as f:
-            content = f.read()
-        return content, 200, {'Content-Type': 'text/plain'}
-    else:
-        return "# No cookie file uploaded", 404, {'Content-Type': 'text/plain'}
-
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Simple health check endpoint"""
     return jsonify({
         "status": "ok",
-        "version": "1.1.0",
+        "version": "1.0.0",
+        "ytdlp_version": YTDLP_VERSION,
         "cookie_file_exists": os.path.exists(COOKIE_FILE),
-        "downloads_folder_size_mb": get_folder_size(DOWNLOAD_FOLDER) / (1024 * 1024),
-        "temp_folder_size_mb": get_folder_size(TEMP_FOLDER) / (1024 * 1024)
+        "downloads_active": len(downloads_in_progress),
+        "downloads_completed": len(completed_downloads),
+        "storage_usage": {
+            "downloads_folder_mb": get_folder_size_mb(DOWNLOAD_FOLDER),
+            "temp_folder_mb": get_folder_size_mb(TEMP_FOLDER)
+        }
     })
 
-def get_folder_size(folder_path):
-    """Calculate the size of a folder in bytes"""
+def get_folder_size_mb(folder_path):
+    """Calculate folder size in MB"""
     total_size = 0
     for dirpath, dirnames, filenames in os.walk(folder_path):
         for f in filenames:
             fp = os.path.join(dirpath, f)
-            if os.path.isfile(fp):
+            if os.path.exists(fp):
                 total_size += os.path.getsize(fp)
-    return total_size
+    return round(total_size / (1024 * 1024), 2)  # Convert to MB
 
-# Add a simple homepage
-@app.route('/', methods=['GET'])
-def homepage():
-    """Simple homepage with API documentation"""
-    return """
-    <html>
-        <head>
-            <title>VibeDownloader API</title>
-            <style>
-                body {
-                    font-family: Arial, sans-serif;
-                    line-height: 1.6;
-                    margin: 20px;
-                    max-width: 800px;
-                    margin: 0 auto;
-                    padding: 20px;
-                }
-                h1 {
-                    color: #333;
-                }
-                h2 {
-                    margin-top: 30px;
-                    color: #444;
-                }
-                code {
-                    background-color: #f4f4f4;
-                    padding: 2px 5px;
-                    border-radius: 4px;
-                }
-            </style>
-        </head>
-        <body>
-            <h1>VibeDownloader API</h1>
-            <p>A YouTube video downloader API service.</p>
-            
-            <h2>API Endpoints:</h2>
-            <ul>
-                <li><code>GET /api/video-info?url=YOUTUBE_URL</code> - Get video information</li>
-                <li><code>GET /api/download?url=YOUTUBE_URL&format_id=FORMAT_ID&audio_id=AUDIO_ID</code> - Start download</li>
-                <li><code>GET /api/download-status/DOWNLOAD_ID</code> - Check download status</li>
-                <li><code>GET /api/get-file/DOWNLOAD_ID</code> - Get downloaded file</li>
-                <li><code>GET /api/direct-download/VIDEO_ID/FORMAT_ID</code> - Direct download</li>
-                <li><code>POST /api/upload-cookie</code> - Upload cookie file</li>
-                <li><code>GET /cookie.txt</code> - Check cookie file status</li>
-                <li><code>GET /api/health</code> - API health check</li>
-            </ul>
-        </body>
-    </html>
-    """
-    
-# Entry point for Koyeb
+# For Koyeb deployment
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
+    # Get port from environment variable or use 8080 as default
+    port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port)
