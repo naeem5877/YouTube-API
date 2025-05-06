@@ -7,6 +7,7 @@ import time
 import shutil
 import sys
 import logging
+import json
 from werkzeug.utils import secure_filename
 
 # Configure logging
@@ -22,9 +23,19 @@ app = Flask(__name__)
 # Configuration
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), "downloads")
 TEMP_FOLDER = os.path.join(os.getcwd(), "temp")
+COOKIE_FOLDER = os.path.join(os.getcwd(), "cookies")
 
-# Look for cookie file in multiple locations
+# Ensure all directories exist
+os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+os.makedirs(TEMP_FOLDER, exist_ok=True)
+os.makedirs(COOKIE_FOLDER, exist_ok=True)
+
+# Main cookie file
+MAIN_COOKIE_FILE = os.path.join(COOKIE_FOLDER, "main_cookie.txt")
+
+# Look for cookie files in multiple locations
 COOKIE_FILE_PATHS = [
+    MAIN_COOKIE_FILE,
     os.path.join(os.getcwd(), "cookie.txt"),
     os.path.join(os.getcwd(), "cookies.txt"),
     "/app/cookie.txt",
@@ -36,18 +47,14 @@ COOKIE_FILE = None
 for path in COOKIE_FILE_PATHS:
     if os.path.exists(path) and os.path.isfile(path):
         COOKIE_FILE = path
-        print(f"Found cookie file at: {COOKIE_FILE}")
+        logger.info(f"Found cookie file at: {COOKIE_FILE}")
         break
 
 if not COOKIE_FILE:
-    print("Warning: No cookie file found in any of the expected locations")
+    logger.warning("No cookie file found in any of the expected locations")
 
 # Define yt-dlp version to use
 YTDLP_VERSION = '2025.4.30'
-
-# Create necessary directories
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-os.makedirs(TEMP_FOLDER, exist_ok=True)
 
 # Dictionary to store download progress info
 downloads_in_progress = {}
@@ -77,9 +84,9 @@ def cleanup_old_files():
                 if file_path and os.path.exists(file_path):
                     try:
                         os.remove(file_path)
-                        print(f"Cleaned up completed download: {file_path}")
+                        logger.info(f"Cleaned up completed download: {file_path}")
                     except Exception as e:
-                        print(f"Error deleting {file_path}: {e}")
+                        logger.error(f"Error deleting {file_path}: {e}")
                 to_remove.append(download_id)
 
         # Remove tracked completed downloads
@@ -98,9 +105,9 @@ def cleanup_old_files():
                 if os.path.isfile(file_path) and now - os.path.getmtime(file_path) > 1800:  # 30 minutes
                     try:
                         os.remove(file_path)
-                        print(f"Cleaned up old file: {file_path}")
+                        logger.info(f"Cleaned up old file: {file_path}")
                     except Exception as e:
-                        print(f"Error deleting {file_path}: {e}")
+                        logger.error(f"Error deleting {file_path}: {e}")
 
         time.sleep(300)  # Check every 5 minutes
 
@@ -108,8 +115,78 @@ def cleanup_old_files():
 cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
 
+def validate_cookie_file(cookie_path):
+    """Validate the cookie file format"""
+    try:
+        if not os.path.exists(cookie_path):
+            return False, "File does not exist"
+            
+        with open(cookie_path, 'r') as f:
+            content = f.read().strip()
+            
+        if not content:
+            return False, "Cookie file is empty"
+            
+        # Check for basic Netscape cookie file format header
+        if not content.startswith("# Netscape") and not content.startswith("# HTTP"):
+            # Try to detect if it's JSON format and convert it
+            try:
+                if content.startswith('{') or content.startswith('['):
+                    json_data = json.loads(content)
+                    # Convert JSON to Netscape format
+                    with open(cookie_path, 'w') as f:
+                        f.write("# Netscape HTTP Cookie File\n")
+                        # Add basic format
+                        for cookie in json_data:
+                            domain = cookie.get('domain', '.youtube.com')
+                            path = cookie.get('path', '/')
+                            secure = 'TRUE' if cookie.get('secure', True) else 'FALSE'
+                            expires = str(cookie.get('expirationDate', int(time.time() + 86400)))
+                            name = cookie.get('name', '')
+                            value = cookie.get('value', '')
+                            if name and value:
+                                f.write(f"{domain}\tTRUE\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+                    return True, "Converted JSON cookie to Netscape format"
+            except json.JSONDecodeError:
+                # Look for YouTube cookies in non-standard format
+                if 'youtube' in content.lower() and ('=' in content or ':' in content):
+                    # Try to extract in a simple format
+                    with open(cookie_path, 'w') as f:
+                        f.write("# Netscape HTTP Cookie File\n")
+                        for line in content.split('\n'):
+                            if '=' in line or ':' in line:
+                                # Extract name-value pairs
+                                sep = '=' if '=' in line else ':'
+                                parts = line.split(sep, 1)
+                                if len(parts) == 2:
+                                    name = parts[0].strip()
+                                    value = parts[1].strip()
+                                    f.write(f".youtube.com\tTRUE\t/\tTRUE\t{int(time.time() + 86400)}\t{name}\t{value}\n")
+                    return True, "Converted simple cookie format to Netscape format"
+                
+                return False, "Cookie file does not appear to be in Netscape or JSON format"
+        
+        # Check for critical YouTube cookies
+        important_cookies = ['SID', 'HSID', 'SSID', 'APISID', 'SAPISID', '__Secure-3PAPISID']
+        found_important = False
+        
+        for cookie in important_cookies:
+            if cookie in content:
+                found_important = True
+                break
+                
+        if not found_important:
+            return False, "No critical YouTube authentication cookies found"
+            
+        return True, "Cookie file appears valid"
+        
+    except Exception as e:
+        return False, f"Error validating cookie file: {str(e)}"
+
 def get_base_ydl_opts():
     """Return base yt-dlp options with enhanced cookie handling"""
+    global COOKIE_FILE
+    
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
@@ -118,23 +195,25 @@ def get_base_ydl_opts():
         'rm_cache_dir': True,          # Clean cache directory
     }
 
+    # Always use the main cookie file if it exists
+    if os.path.exists(MAIN_COOKIE_FILE):
+        COOKIE_FILE = MAIN_COOKIE_FILE
+    
     # Add cookie file if exists with proper error handling
-    if os.path.exists(COOKIE_FILE):
+    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
         try:
-            # Check if cookie file is readable
-            with open(COOKIE_FILE, 'r') as f:
-                cookie_content = f.read()
-                
-            # Only use cookie file if it has content
-            if cookie_content.strip():
-                print(f"Using cookie file: {COOKIE_FILE}")
+            # Validate the cookie file
+            valid, message = validate_cookie_file(COOKIE_FILE)
+            
+            if valid:
+                logger.info(f"Using cookie file: {COOKIE_FILE} - {message}")
                 ydl_opts['cookiefile'] = COOKIE_FILE
             else:
-                print("Cookie file exists but is empty")
+                logger.warning(f"Cookie file issue: {message}")
         except Exception as e:
-            print(f"Error reading cookie file: {e}")
+            logger.error(f"Error reading cookie file: {e}")
     else:
-        print(f"Cookie file not found at: {COOKIE_FILE}")
+        logger.warning(f"Cookie file not found at: {COOKIE_FILE}")
         
     return ydl_opts
 
@@ -184,6 +263,147 @@ def get_channel_profile_picture(info):
 
     return None
 
+# Cookie management routes
+@app.route('/api/cookie/upload', methods=['POST'])
+def upload_cookie():
+    """
+    Upload a cookie file via API
+    
+    Parameters:
+    - file: cookie file (form-data)
+    - format: cookie format (optional, defaults to "netscape")
+    
+    Returns:
+    - Status of the cookie upload
+    """
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+        
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+        
+    # Save the cookie file
+    try:
+        file.save(MAIN_COOKIE_FILE)
+        
+        # Validate the cookie file
+        valid, message = validate_cookie_file(MAIN_COOKIE_FILE)
+        
+        if valid:
+            global COOKIE_FILE
+            COOKIE_FILE = MAIN_COOKIE_FILE
+            return jsonify({
+                "status": "success", 
+                "message": f"Cookie file uploaded successfully. {message}"
+            })
+        else:
+            return jsonify({
+                "status": "warning",
+                "message": f"Cookie file uploaded, but validation raised concerns: {message}"
+            })
+            
+    except Exception as e:
+        return jsonify({"error": f"Failed to save cookie file: {str(e)}"}), 500
+
+@app.route('/api/cookie/text', methods=['POST'])
+def upload_cookie_text():
+    """
+    Upload cookie data as text
+    
+    Parameters:
+    - cookie_text: raw cookie text/data (JSON or form-data)
+    
+    Returns:
+    - Status of the cookie upload
+    """
+    try:
+        # Try to get from form data
+        cookie_text = request.form.get('cookie_text')
+        
+        # If not in form data, try JSON
+        if not cookie_text and request.is_json:
+            data = request.get_json()
+            cookie_text = data.get('cookie_text')
+            
+        # If still not found, check for raw data
+        if not cookie_text:
+            cookie_text = request.data.decode('utf-8')
+            
+        if not cookie_text:
+            return jsonify({"error": "No cookie data provided"}), 400
+            
+        # Save the cookie text to file
+        with open(MAIN_COOKIE_FILE, 'w') as f:
+            f.write(cookie_text)
+            
+        # Validate the cookie file
+        valid, message = validate_cookie_file(MAIN_COOKIE_FILE)
+        
+        if valid:
+            global COOKIE_FILE
+            COOKIE_FILE = MAIN_COOKIE_FILE
+            return jsonify({
+                "status": "success", 
+                "message": f"Cookie data saved successfully. {message}"
+            })
+        else:
+            return jsonify({
+                "status": "warning",
+                "message": f"Cookie data saved, but validation raised concerns: {message}"
+            })
+            
+    except Exception as e:
+        return jsonify({"error": f"Failed to save cookie data: {str(e)}"}), 500
+
+@app.route('/api/cookie/status', methods=['GET'])
+def cookie_status():
+    """
+    Check cookie file status
+    
+    Returns:
+    - Information about the current cookie file
+    """
+    if not COOKIE_FILE or not os.path.exists(COOKIE_FILE):
+        return jsonify({
+            "status": "missing",
+            "message": "No cookie file found"
+        })
+        
+    try:
+        valid, message = validate_cookie_file(COOKIE_FILE)
+        
+        with open(COOKIE_FILE, 'r') as f:
+            # Read first 5 lines to get a preview (excluding sensitive data)
+            preview_lines = []
+            for i, line in enumerate(f):
+                if i >= 5:
+                    break
+                # Mask actual cookie values for privacy
+                if '\t' in line and line.count('\t') >= 6:
+                    parts = line.split('\t')
+                    if len(parts) >= 7:
+                        preview_lines.append(f"{parts[0]}\t...\t{parts[5]}\t***MASKED***")
+                else:
+                    # For headers or non-standard lines
+                    preview_lines.append(line.strip())
+            
+        return jsonify({
+            "status": "valid" if valid else "invalid",
+            "message": message,
+            "path": COOKIE_FILE,
+            "size_bytes": os.path.getsize(COOKIE_FILE),
+            "last_modified": time.ctime(os.path.getmtime(COOKIE_FILE)),
+            "preview": preview_lines
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error reading cookie file: {str(e)}",
+            "path": COOKIE_FILE
+        })
+
 @app.route('/api/video-info', methods=['GET'])
 def get_video_info():
     """
@@ -205,32 +425,34 @@ def get_video_info():
         ydl_opts['extract_flat'] = False  # Ensure we get full info
         
         # Add verbose logging for debugging
-        print(f"Extracting info for URL: {url}")
+        logger.info(f"Extracting info for URL: {url}")
         
         # Check if cookie file is being used
         if 'cookiefile' in ydl_opts:
-            print(f"Using cookie file: {ydl_opts['cookiefile']}")
+            logger.info(f"Using cookie file: {ydl_opts['cookiefile']}")
         else:
-            print("No cookie file being used")
+            logger.warning("No cookie file being used")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # Extract full info with formats
             try:
                 info = ydl.extract_info(url, download=False)
                 if not info:
-                    print("Info extraction returned None")
+                    logger.error("Info extraction returned None")
                     return jsonify({"error": "Could not extract video information"}), 500
             except Exception as e:
-                print(f"Error during info extraction: {str(e)}")
+                error_message = str(e)
+                logger.error(f"Error during info extraction: {error_message}")
                 
                 # Return more helpful error message
-                if "Sign in to confirm you're not a bot" in str(e):
+                if "Sign in to confirm you're not a bot" in error_message:
                     return jsonify({
-                        "error": "YouTube requires authentication. The cookie file may be invalid or expired.",
-                        "details": str(e)
+                        "error": "YouTube requires authentication. Upload a valid cookie file using /api/cookie/upload",
+                        "details": error_message,
+                        "solution": "Upload valid YouTube cookies using POST to /api/cookie/upload or /api/cookie/text"
                     }), 401
                 else:
-                    return jsonify({"error": f"Error extracting video info: {str(e)}"}), 500
+                    return jsonify({"error": f"Error extracting video info: {error_message}"}), 500
 
             video_id = info.get('id')
 
@@ -503,7 +725,7 @@ def merge_video_audio(video_path, audio_path, output_path):
         subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return True
     except Exception as e:
-        print(f"Error merging files: {e}")
+        logger.error(f"Error merging files: {e}")
         return False
 
 def update_progress(download_id, d):
@@ -553,202 +775,263 @@ def check_download_status(download_id):
             "download_url": completed_downloads[download_id].get("download_url")
         })
 
-    return jsonify({"error": "Download ID not found"}), 404
+    # Download not found
+    return jsonify({
+        "download_id": download_id,
+        "status": "not_found",
+        "message": "Download not found. It may have been cleaned up or never existed."
+    }), 404
 
 @app.route('/api/get-file/<download_id>', methods=['GET'])
-def get_downloaded_file(download_id):
+def get_file(download_id):
     """
-    Get a downloaded file
+    Get the downloaded file
 
     Path parameters:
-    - download_id: ID of the download to get
+    - download_id: ID of the completed download
 
     Returns:
-    - The downloaded file
+    - Video file for download
     """
-    if download_id in completed_downloads and completed_downloads[download_id]["status"] == "completed":
-        file_path = completed_downloads[download_id]["file_path"]
-
-        if os.path.exists(file_path):
-            filename = os.path.basename(file_path)
-            return send_file(file_path, as_attachment=True, download_name=filename)
-
-    return jsonify({"error": "File not found"}), 404
+    # Check if download is completed
+    if download_id in completed_downloads:
+        info = completed_downloads[download_id]
+        
+        if info["status"] != "completed":
+            return jsonify({
+                "error": "Download failed or is still in progress", 
+                "status": info["status"]
+            }), 400
+            
+        file_path = info.get("file_path")
+        
+        if not file_path or not os.path.exists(file_path):
+            return jsonify({
+                "error": "File not found or has been cleaned up",
+                "status": "file_missing"
+            }), 404
+            
+        # Get video file name
+        filename = os.path.basename(file_path)
+        
+        # Extract title from database if available
+        title = None
+        if "title" in info:
+            title = info["title"]
+            # Create a safe filename
+            safe_title = secure_filename(title)
+            if safe_title:
+                filename = f"{safe_title}.mp4"
+        
+        # Send file for download
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='video/mp4'
+        )
+        
+    # Download not found
+    return jsonify({
+        "error": "Download not found",
+        "status": "not_found"
+    }), 404
 
 @app.route('/api/direct-download/<video_id>/<format_id>', methods=['GET'])
 def direct_download(video_id, format_id):
     """
-    Direct download endpoint that combines video with best audio and sends the file
+    Direct download of a specific format
 
     Path parameters:
     - video_id: YouTube video ID
     - format_id: Format ID to download
 
-    Query parameters:
-    - audio_id: (Optional) Specific audio format ID
-    - filename: (Optional) Custom filename for the download
-
     Returns:
-    - The downloaded file directly to the browser
+    - File download of the requested format
     """
-    audio_id = request.args.get('audio_id')
-    custom_filename = request.args.get('filename')
-    url = f"https://www.youtube.com/watch?v={video_id}"
-
     try:
-        # Create a unique filename based on video ID and format
-        filename = f"{video_id}_{format_id}"
-        if audio_id:
-            filename += f"_{audio_id}"
-        filename += ".mp4"
-
-        output_path = os.path.join(DOWNLOAD_FOLDER, filename)
-
-        # Check if file already exists (cached)
-        if os.path.exists(output_path):
-            download_name = custom_filename if custom_filename else f"{video_id}.mp4"
-            return send_file(output_path, as_attachment=True, download_name=download_name)
-
-        # Set up download options
+        download_id = f"direct_{video_id}_{format_id}_{str(uuid.uuid4())[:8]}"
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        # Set up options for direct download
         ydl_opts = get_base_ydl_opts()
-
-        # Add progress hooks
-        download_id = str(uuid.uuid4())
-        downloads_in_progress[download_id] = {
-            "status": "downloading",
-            "progress": 0,
-            "url": url,
-            "start_time": time.time()
-        }
-
         ydl_opts.update({
-            'progress_hooks': [lambda d: update_progress(download_id, d)],
+            'format': format_id,
+            'outtmpl': os.path.join(TEMP_FOLDER, f"{download_id}.%(ext)s"),
         })
-
-        # Always combine with best audio if format is video-only
-        ydl_opts.update({
-            'format': f"{format_id}+bestaudio" if not audio_id else f"{format_id}+{audio_id}",
-            'outtmpl': output_path,
-            'merge_output_format': 'mp4',
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
-        })
-
-        # Download the file
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url)
-
-            # Get the actual title for a better filename if not provided
-            if not custom_filename and info.get('title'):
-                video_title = info.get('title')
-                # Clean the title for use as a filename
-                video_title = ''.join(c for c in video_title if c.isalnum() or c in ' ._-')
-                download_name = f"{video_title}.mp4"
-            else:
-                download_name = custom_filename if custom_filename else f"{video_id}.mp4"
-
-        # Update downloads info and remove from in-progress
-        if download_id in downloads_in_progress:
-            downloads_in_progress.pop(download_id)
-
-        completed_downloads[download_id] = {
-            "status": "completed",
-            "url": url,
-            "file_path": output_path,
-            "completion_time": time.time()
-        }
-
-        # Check if download was successful
-        if os.path.exists(output_path):
-            return send_file(output_path, as_attachment=True, download_name=download_name)
-        else:
-            return jsonify({"error": "Download failed"}), 500
-
+            title = info.get('title', video_id)
+            downloaded_file = ydl.prepare_filename(info)
+            
+            # Find the actual downloaded file (extension might be different)
+            actual_file = downloaded_file
+            if not os.path.exists(actual_file):
+                # Get the file extension from the info
+                ext = info.get('ext', 'mp4')
+                # Try with correct extension
+                actual_file = downloaded_file.rsplit(".", 1)[0] + f".{ext}"
+                if not os.path.exists(actual_file):
+                    # Try to find the file with different extensions
+                    for ext in ['mp4', 'webm', 'mkv', 'm4a', 'mp3']:
+                        candidate = downloaded_file.rsplit(".", 1)[0] + f".{ext}"
+                        if os.path.exists(candidate):
+                            actual_file = candidate
+                            break
+            
+            if not os.path.exists(actual_file):
+                return jsonify({
+                    "error": "Download failed, file not found",
+                    "status": "failed"
+                }), 500
+                
+            # Create safe filename
+            safe_title = secure_filename(title)
+            if not safe_title:
+                safe_title = video_id
+                
+            # Determine file extension
+            file_ext = os.path.splitext(actual_file)[1]
+            if not file_ext:
+                file_ext = '.mp4'  # Default to mp4
+                
+            # Determine mimetype
+            mimetype = 'video/mp4'
+            if file_ext == '.mp3' or file_ext == '.m4a':
+                mimetype = 'audio/mpeg'
+            elif file_ext == '.webm':
+                mimetype = 'video/webm'
+                
+            # Create download filename
+            download_name = f"{safe_title}{file_ext}"
+            
+            # Send file
+            return send_file(
+                actual_file,
+                as_attachment=True,
+                download_name=download_name,
+                mimetype=mimetype
+            )
+            
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Direct download error: {e}")
+        return jsonify({
+            "error": f"Download failed: {str(e)}",
+            "status": "failed"
+        }), 500
 
-@app.route('/api/health', methods=['GET'])
+@app.route('/api/version', methods=['GET'])
+def get_version():
+    """Get API and yt-dlp version information"""
+    try:
+        return jsonify({
+            "api_version": "1.0.0",
+            "yt_dlp_version": YTDLP_VERSION,
+            "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "cookie_file": COOKIE_FILE is not None,
+            "cookie_file_path": COOKIE_FILE
+        })
+    except Exception as e:
+        return jsonify({
+            "error": f"Error getting version info: {str(e)}"
+        }), 500
+
+@app.route('/health', methods=['GET'])
 def health_check():
-    """Enhanced health check endpoint - Important for Koyeb to consider service healthy"""
-    # Always return status code 200 for health checks to keep service running
-    cookie_status = "not_found"
-    cookie_content = ""
-    
-    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
-        try:
-            with open(COOKIE_FILE, 'r') as f:
-                content = f.read(100)  # Just read the first 100 chars to check
-                cookie_content = f"{len(content)} characters" if content else "empty"
-                cookie_status = "valid" if content else "empty"
-        except Exception as e:
-            cookie_status = f"error: {str(e)}"
-    
-    # Check environment
-    app_dir = os.getcwd()
-    files_in_dir = os.listdir(app_dir)[:10]  # List first 10 files
-    
+    """Simple health check endpoint"""
     return jsonify({
         "status": "ok",
-        "version": "1.0.0",
-        "ytdlp_version": YTDLP_VERSION,
-        "cookie_file": {
-            "path": COOKIE_FILE,
-            "exists": COOKIE_FILE and os.path.exists(COOKIE_FILE),
-            "status": cookie_status,
-            "content_preview": cookie_content
-        },
-        "environment": {
-            "app_directory": app_dir,
-            "files": files_in_dir,
-            "python_version": sys.version
-        },
-        "downloads_active": len(downloads_in_progress),
-        "downloads_completed": len(completed_downloads),
-        "storage_usage": {
-            "downloads_folder_mb": get_folder_size_mb(DOWNLOAD_FOLDER),
-            "temp_folder_mb": get_folder_size_mb(TEMP_FOLDER)
-        }
+        "timestamp": time.time()
     })
 
-def get_folder_size_mb(folder_path):
-    """Calculate folder size in MB"""
-    total_size = 0
-    for dirpath, dirnames, filenames in os.walk(folder_path):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            if os.path.exists(fp):
-                total_size += os.path.getsize(fp)
-    return round(total_size / (1024 * 1024), 2)  # Convert to MB
-
-# Add a root route for easy checking if service is up
+# Simple static page for the API documentation
 @app.route('/', methods=['GET'])
-def root():
-    """Root endpoint to verify the API is running"""
-    return jsonify({
-        "status": "running",
-        "message": "YouTube Downloader API is active",
-        "endpoints": {
-            "health": "/api/health",
-            "video_info": "/api/video-info?url=VIDEO_URL",
-            "download": "/api/download?url=VIDEO_URL&format_id=FORMAT_ID",
-            "download_status": "/api/download-status/DOWNLOAD_ID",
-            "get_file": "/api/get-file/DOWNLOAD_ID",
-            "direct_download": "/api/direct-download/VIDEO_ID/FORMAT_ID"
-        }
-    })
+def index():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>YouTube Download API</title>
+        <style>
+            body { font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; color: #333; max-width: 800px; margin: 0 auto; }
+            h1 { color: #e62117; }
+            h2 { margin-top: 20px; color: #444; }
+            code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; font-family: monospace; }
+            pre { background: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }
+            .endpoint { margin-bottom: 20px; border-bottom: 1px solid #eee; padding-bottom: 20px; }
+            .method { font-weight: bold; color: #e62117; }
+        </style>
+    </head>
+    <body>
+        <h1>YouTube Download API</h1>
+        <p>API for extracting YouTube video information and downloading videos using yt-dlp.</p>
+        
+        <h2>Endpoints:</h2>
+        
+        <div class="endpoint">
+            <h3><span class="method">GET</span> /api/video-info</h3>
+            <p>Get video information including available formats</p>
+            <p><strong>Query params:</strong> <code>url</code> (YouTube video URL)</p>
+        </div>
+        
+        <div class="endpoint">
+            <h3><span class="method">GET</span> /api/download</h3>
+            <p>Download a video and combine with best audio</p>
+            <p><strong>Query params:</strong></p>
+            <ul>
+                <li><code>url</code> (YouTube video URL)</li>
+                <li><code>format_id</code> (Optional) Specific video format ID</li>
+                <li><code>audio_id</code> (Optional) Specific audio format ID</li>
+            </ul>
+        </div>
+        
+        <div class="endpoint">
+            <h3><span class="method">GET</span> /api/download-status/{download_id}</h3>
+            <p>Check the status of a download</p>
+        </div>
+        
+        <div class="endpoint">
+            <h3><span class="method">GET</span> /api/get-file/{download_id}</h3>
+            <p>Get the downloaded file</p>
+        </div>
+        
+        <div class="endpoint">
+            <h3><span class="method">GET</span> /api/direct-download/{video_id}/{format_id}</h3>
+            <p>Direct download of a specific format</p>
+        </div>
+        
+        <div class="endpoint">
+            <h3><span class="method">POST</span> /api/cookie/upload</h3>
+            <p>Upload a cookie file via API</p>
+        </div>
+        
+        <div class="endpoint">
+            <h3><span class="method">POST</span> /api/cookie/text</h3>
+            <p>Upload cookie data as text</p>
+        </div>
+        
+        <div class="endpoint">
+            <h3><span class="method">GET</span> /api/cookie/status</h3>
+            <p>Check cookie file status</p>
+        </div>
+        
+        <div class="endpoint">
+            <h3><span class="method">GET</span> /api/version</h3>
+            <p>Get API and yt-dlp version information</p>
+        </div>
+        
+        <div class="endpoint">
+            <h3><span class="method">GET</span> /health</h3>
+            <p>Simple health check endpoint</p>
+        </div>
+    </body>
+    </html>
+    """
 
-# For Koyeb deployment
 if __name__ == '__main__':
-    # Get port from environment variable or use 8080 as default
-    port = int(os.environ.get('PORT', 8080))
+    # Get port from environment or use default
+    port = int(os.environ.get('PORT', 5000))
     
-    # Log startup information
-    logger.info(f"Starting YouTube Downloader API on port {port}")
-    logger.info(f"Python version: {sys.version}")
-    logger.info(f"Cookie file path: {COOKIE_FILE}")
-    logger.info(f"Cookie file exists: {COOKIE_FILE and os.path.exists(COOKIE_FILE)}")
-    
-    # Run the app
-    app.run(host='0.0.0.0', port=port)
+    # Start the Flask app
+    app.run(host='0.0.0.0', port=port, debug=False)
