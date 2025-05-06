@@ -5,14 +5,42 @@ import uuid
 import threading
 import time
 import shutil
+import sys
+import logging
 from werkzeug.utils import secure_filename
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger('youtube-api')
 
 app = Flask(__name__)
 
 # Configuration
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), "downloads")
-COOKIE_FILE = os.path.join(os.getcwd(), "cookie.txt")
 TEMP_FOLDER = os.path.join(os.getcwd(), "temp")
+
+# Look for cookie file in multiple locations
+COOKIE_FILE_PATHS = [
+    os.path.join(os.getcwd(), "cookie.txt"),
+    os.path.join(os.getcwd(), "cookies.txt"),
+    "/app/cookie.txt",
+    "/app/cookies.txt"
+]
+
+# Find the first available cookie file
+COOKIE_FILE = None
+for path in COOKIE_FILE_PATHS:
+    if os.path.exists(path) and os.path.isfile(path):
+        COOKIE_FILE = path
+        print(f"Found cookie file at: {COOKIE_FILE}")
+        break
+
+if not COOKIE_FILE:
+    print("Warning: No cookie file found in any of the expected locations")
 
 # Define yt-dlp version to use
 YTDLP_VERSION = '2025.4.30'
@@ -81,16 +109,33 @@ cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
 
 def get_base_ydl_opts():
-    """Return base yt-dlp options with cookie file if exists"""
+    """Return base yt-dlp options with enhanced cookie handling"""
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'ignoreerrors': True,
+        'no_check_certificate': True,  # Skip HTTPS certificate validation
+        'rm_cache_dir': True,          # Clean cache directory
     }
 
+    # Add cookie file if exists with proper error handling
     if os.path.exists(COOKIE_FILE):
-        ydl_opts['cookiefile'] = COOKIE_FILE
-
+        try:
+            # Check if cookie file is readable
+            with open(COOKIE_FILE, 'r') as f:
+                cookie_content = f.read()
+                
+            # Only use cookie file if it has content
+            if cookie_content.strip():
+                print(f"Using cookie file: {COOKIE_FILE}")
+                ydl_opts['cookiefile'] = COOKIE_FILE
+            else:
+                print("Cookie file exists but is empty")
+        except Exception as e:
+            print(f"Error reading cookie file: {e}")
+    else:
+        print(f"Cookie file not found at: {COOKIE_FILE}")
+        
     return ydl_opts
 
 def get_verification_status(info):
@@ -158,13 +203,34 @@ def get_video_info():
         # Ensure we're using the specified yt-dlp version
         ydl_opts = get_base_ydl_opts()
         ydl_opts['extract_flat'] = False  # Ensure we get full info
+        
+        # Add verbose logging for debugging
+        print(f"Extracting info for URL: {url}")
+        
+        # Check if cookie file is being used
+        if 'cookiefile' in ydl_opts:
+            print(f"Using cookie file: {ydl_opts['cookiefile']}")
+        else:
+            print("No cookie file being used")
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # Extract full info with formats
-            info = ydl.extract_info(url, download=False)
-
-            if not info:
-                return jsonify({"error": "Could not extract video information"}), 500
+            try:
+                info = ydl.extract_info(url, download=False)
+                if not info:
+                    print("Info extraction returned None")
+                    return jsonify({"error": "Could not extract video information"}), 500
+            except Exception as e:
+                print(f"Error during info extraction: {str(e)}")
+                
+                # Return more helpful error message
+                if "Sign in to confirm you're not a bot" in str(e):
+                    return jsonify({
+                        "error": "YouTube requires authentication. The cookie file may be invalid or expired.",
+                        "details": str(e)
+                    }), 401
+                else:
+                    return jsonify({"error": f"Error extracting video info: {str(e)}"}), 500
 
             video_id = info.get('id')
 
@@ -605,12 +671,39 @@ def direct_download(video_id, format_id):
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Simple health check endpoint"""
+    """Enhanced health check endpoint - Important for Koyeb to consider service healthy"""
+    # Always return status code 200 for health checks to keep service running
+    cookie_status = "not_found"
+    cookie_content = ""
+    
+    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+        try:
+            with open(COOKIE_FILE, 'r') as f:
+                content = f.read(100)  # Just read the first 100 chars to check
+                cookie_content = f"{len(content)} characters" if content else "empty"
+                cookie_status = "valid" if content else "empty"
+        except Exception as e:
+            cookie_status = f"error: {str(e)}"
+    
+    # Check environment
+    app_dir = os.getcwd()
+    files_in_dir = os.listdir(app_dir)[:10]  # List first 10 files
+    
     return jsonify({
         "status": "ok",
         "version": "1.0.0",
         "ytdlp_version": YTDLP_VERSION,
-        "cookie_file_exists": os.path.exists(COOKIE_FILE),
+        "cookie_file": {
+            "path": COOKIE_FILE,
+            "exists": COOKIE_FILE and os.path.exists(COOKIE_FILE),
+            "status": cookie_status,
+            "content_preview": cookie_content
+        },
+        "environment": {
+            "app_directory": app_dir,
+            "files": files_in_dir,
+            "python_version": sys.version
+        },
         "downloads_active": len(downloads_in_progress),
         "downloads_completed": len(completed_downloads),
         "storage_usage": {
@@ -629,8 +722,33 @@ def get_folder_size_mb(folder_path):
                 total_size += os.path.getsize(fp)
     return round(total_size / (1024 * 1024), 2)  # Convert to MB
 
+# Add a root route for easy checking if service is up
+@app.route('/', methods=['GET'])
+def root():
+    """Root endpoint to verify the API is running"""
+    return jsonify({
+        "status": "running",
+        "message": "YouTube Downloader API is active",
+        "endpoints": {
+            "health": "/api/health",
+            "video_info": "/api/video-info?url=VIDEO_URL",
+            "download": "/api/download?url=VIDEO_URL&format_id=FORMAT_ID",
+            "download_status": "/api/download-status/DOWNLOAD_ID",
+            "get_file": "/api/get-file/DOWNLOAD_ID",
+            "direct_download": "/api/direct-download/VIDEO_ID/FORMAT_ID"
+        }
+    })
+
 # For Koyeb deployment
 if __name__ == '__main__':
     # Get port from environment variable or use 8080 as default
     port = int(os.environ.get('PORT', 8080))
+    
+    # Log startup information
+    logger.info(f"Starting YouTube Downloader API on port {port}")
+    logger.info(f"Python version: {sys.version}")
+    logger.info(f"Cookie file path: {COOKIE_FILE}")
+    logger.info(f"Cookie file exists: {COOKIE_FILE and os.path.exists(COOKIE_FILE)}")
+    
+    # Run the app
     app.run(host='0.0.0.0', port=port)
