@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response
 import yt_dlp
 import os
 import uuid
@@ -6,6 +6,12 @@ import threading
 import time
 import json
 from werkzeug.utils import secure_filename
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO,
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -22,30 +28,39 @@ os.makedirs(TEMP_FOLDER, exist_ok=True)
 downloads_in_progress = {}
 completed_downloads = {}
 
-# Function to clean up old files periodically (reduced frequency for Koyeb)
+# Max request timeout (in seconds) - critical for preventing worker timeouts
+REQUEST_TIMEOUT = 25  # Keep requests under 30 seconds to avoid platform timeouts
+
+# Function to clean up old files periodically
 def cleanup_old_files():
     while True:
-        now = time.time()
-        # Delete files older than 30 minutes to save space on Koyeb
-        for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
-            for filename in os.listdir(folder):
-                file_path = os.path.join(folder, filename)
-                if os.path.isfile(file_path) and now - os.path.getmtime(file_path) > 1800:  # 30 minutes
-                    try:
-                        os.remove(file_path)
-                    except Exception as e:
-                        print(f"Error deleting {file_path}: {e}")
+        try:
+            now = time.time()
+            # Delete files older than 30 minutes to save space
+            for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
+                for filename in os.listdir(folder):
+                    file_path = os.path.join(folder, filename)
+                    if os.path.isfile(file_path) and now - os.path.getmtime(file_path) > 1800:  # 30 minutes
+                        try:
+                            os.remove(file_path)
+                            logger.info(f"Cleaned up old file: {file_path}")
+                        except Exception as e:
+                            logger.error(f"Error deleting {file_path}: {e}")
 
-        # Clean up completed downloads dictionary
-        to_remove = []
-        for download_id, info in completed_downloads.items():
-            if now - info.get("completion_time", 0) > 1800:  # 30 minutes
-                to_remove.append(download_id)
+            # Clean up completed downloads dictionary
+            to_remove = []
+            for download_id, info in completed_downloads.items():
+                if now - info.get("completion_time", 0) > 1800:  # 30 minutes
+                    to_remove.append(download_id)
 
-        for download_id in to_remove:
-            completed_downloads.pop(download_id, None)
+            for download_id in to_remove:
+                completed_downloads.pop(download_id, None)
+                logger.info(f"Cleaned up completed download record: {download_id}")
 
-        time.sleep(3600)  # Check every hour
+            time.sleep(3600)  # Check every hour
+        except Exception as e:
+            logger.error(f"Error in cleanup thread: {e}")
+            time.sleep(3600)  # Still sleep on error
 
 # Start cleanup thread
 cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
@@ -57,6 +72,7 @@ def get_base_ydl_opts():
         'quiet': True,
         'no_warnings': True,
         'ignoreerrors': True,
+        'socket_timeout': 10,  # Lower socket timeout to avoid hanging
     }
 
     if os.path.exists(COOKIE_FILE):
@@ -104,12 +120,8 @@ def get_subscriber_count(info_dict):
 def get_video_info():
     """
     Get video information including available formats
-
-    Query parameters:
-    - url: YouTube video URL
-
-    Returns:
-    - Video information including title, thumbnail, channel info, and available formats with direct download links
+    
+    This endpoint is optimized to return quickly to avoid worker timeouts
     """
     url = request.args.get('url')
     if not url:
@@ -117,95 +129,128 @@ def get_video_info():
 
     try:
         ydl_opts = get_base_ydl_opts()
+        
+        # These options make extraction faster
         ydl_opts.update({
-            'extract_flat': False,  # We need full info to get subscribers
+            'extract_flat': False,
             'skip_download': True,
+            'timeout': 10,  # Timeout for connections
         })
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Use a timeout to prevent hanging
             info = ydl.extract_info(url, download=False)
+            if not info:
+                return jsonify({"error": "Could not extract video information"}), 500
+                
             video_id = info.get('id')
 
-            # Extract relevant information
+            # Extract only necessary information to make response lighter
             result = {
                 "id": video_id,
                 "title": info.get('title'),
-                "description": info.get('description'),
+                "description": info.get('description', '')[:500] + ('...' if info.get('description', '') and len(info.get('description', '')) > 500 else ''),  # Truncate long descriptions
                 "duration": info.get('duration'),
                 "view_count": info.get('view_count'),
                 "like_count": info.get('like_count'),
                 "upload_date": info.get('upload_date'),
-                "thumbnails": info.get('thumbnails', []),
                 "channel": {
                     "id": info.get('channel_id'),
                     "name": info.get('channel', info.get('uploader')),
                     "url": info.get('channel_url'),
-                    "profile_picture": None,  # Will be updated if available
                     "verified": get_verification_status(info),
                     "subscriber_count": get_subscriber_count(info)
                 },
                 "audio_formats": [],
                 "video_formats": []
             }
+            
+            # Add main thumbnail only
+            if info.get('thumbnails') and len(info.get('thumbnails')) > 0:
+                result['thumbnail'] = info.get('thumbnails')[-1].get('url')
+            else:
+                result['thumbnail'] = None
 
             # Try to extract channel profile picture if available
             for thumbnail in info.get('thumbnails', []):
                 if 'url' in thumbnail and ('avatar' in thumbnail.get('id', '') or 'avatar' in thumbnail.get('url', '')):
                     result['channel']['profile_picture'] = thumbnail['url']
                     break
+            
+            if 'channel' in result and 'profile_picture' not in result['channel']:
+                result['channel']['profile_picture'] = None
 
-            # Extract audio formats
+            # Extract audio formats - limit to most common ones to reduce response size
             audio_formats = []
             for format in info.get('formats', []):
                 if format.get('vcodec') == 'none' and format.get('acodec') != 'none':
-                    audio_formats.append({
-                        "format_id": format.get('format_id'),
-                        "ext": format.get('ext'),
-                        "filesize": format.get('filesize'),
-                        "format_note": format.get('format_note'),
-                        "abr": format.get('abr'),
-                        "download_url": f"/api/direct-download/{video_id}/{format.get('format_id')}"
-                    })
+                    # Only include formats with reasonable quality
+                    if format.get('abr', 0) > 48:  # Skip very low quality
+                        audio_formats.append({
+                            "format_id": format.get('format_id'),
+                            "ext": format.get('ext'),
+                            "filesize": format.get('filesize'),
+                            "format_note": format.get('format_note'),
+                            "abr": format.get('abr'),
+                            "download_url": f"/api/direct-download/{video_id}/{format.get('format_id')}"
+                        })
 
-            result["audio_formats"] = audio_formats
+            # Sort audio formats by quality (descending)
+            audio_formats.sort(key=lambda x: x.get('abr', 0), reverse=True)
+            
+            # Limit to top 5 audio formats
+            result["audio_formats"] = audio_formats[:5]
 
             # Extract video formats with direct download links
             video_formats = []
+            common_resolutions = [2160, 1440, 1080, 720, 480, 360, 240, 144]  # Focus on common resolutions
+            
+            format_by_resolution = {}  # To track the best format for each resolution
+            
             for format in info.get('formats', []):
                 if format.get('vcodec') != 'none':
-                    video_formats.append({
-                        "format_id": format.get('format_id'),
-                        "ext": format.get('ext'),
-                        "filesize": format.get('filesize'),
-                        "format_note": format.get('format_note'),
-                        "width": format.get('width'),
-                        "height": format.get('height'),
-                        "fps": format.get('fps'),
-                        "vcodec": format.get('vcodec'),
-                        "acodec": format.get('acodec'),
-                        "download_url": f"/api/direct-download/{video_id}/{format.get('format_id')}",
-                        "resolution": f"{format.get('width', 0)}x{format.get('height', 0)}"
-                    })
-
+                    height = format.get('height', 0)
+                    
+                    # Skip non-standard resolutions unless we don't have any formats yet
+                    if height not in common_resolutions and len(format_by_resolution) > 0:
+                        continue
+                    
+                    # Track the best format for each resolution
+                    if height not in format_by_resolution or format.get('tbr', 0) > format_by_resolution[height].get('tbr', 0):
+                        format_by_resolution[height] = {
+                            "format_id": format.get('format_id'),
+                            "ext": format.get('ext'),
+                            "filesize": format.get('filesize'),
+                            "format_note": format.get('format_note'),
+                            "width": format.get('width'),
+                            "height": format.get('height'),
+                            "fps": format.get('fps'),
+                            "vcodec": format.get('vcodec'),
+                            "acodec": format.get('acodec'),
+                            "tbr": format.get('tbr'),
+                            "download_url": f"/api/direct-download/{video_id}/{format.get('format_id')}",
+                            "resolution": f"{format.get('width', 0)}x{format.get('height', 0)}"
+                        }
+            
+            # Get the best format for each resolution
+            for height, format_info in format_by_resolution.items():
+                video_formats.append(format_info)
+            
+            # Sort video formats by height (descending)
+            video_formats.sort(key=lambda x: x.get('height', 0), reverse=True)
+            
             result["video_formats"] = video_formats
 
             return jsonify(result)
 
     except Exception as e:
+        logger.error(f"Error getting video info: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/download', methods=['GET'])
 def download_video():
     """
-    Download a video and combine with best audio
-
-    Query parameters:
-    - url: YouTube video URL
-    - format_id: (Optional) Specific video format ID to download
-    - audio_id: (Optional) Specific audio format ID to download
-
-    Returns:
-    - Download ID to check status
+    Start a download in the background to avoid worker timeouts
     """
     url = request.args.get('url')
     format_id = request.args.get('format_id')
@@ -216,7 +261,7 @@ def download_video():
 
     download_id = str(uuid.uuid4())
 
-    # Start download in background
+    # Start download in background thread
     thread = threading.Thread(
         target=process_download,
         args=(download_id, url, format_id, audio_id)
@@ -224,6 +269,7 @@ def download_video():
     thread.daemon = True
     thread.start()
 
+    # Return immediately with download ID
     return jsonify({
         "download_id": download_id,
         "status": "processing",
@@ -248,8 +294,13 @@ def process_download(download_id, url, format_id=None, audio_id=None):
         })
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            video_title = info.get('title', 'video')
+            try:
+                info = ydl.extract_info(url, download=False)
+                video_title = info.get('title', 'video')
+            except Exception as e:
+                logger.error(f"Error getting video info in process_download: {str(e)}")
+                video_title = f"download_{download_id}"
+            
             # Clean title for safe filename
             video_title = ''.join(c for c in video_title if c.isalnum() or c in ' ._-')
             video_title = video_title.strip()
@@ -272,20 +323,25 @@ def process_download(download_id, url, format_id=None, audio_id=None):
                 audio_path = download_specific_format(url, audio_id, f"{download_id}_audio")
 
                 # Merge video and audio
-                merge_video_audio(video_path, audio_path, output_path)
+                if video_path and audio_path:
+                    merge_video_audio(video_path, audio_path, output_path)
 
-                # Clean up temp files
-                if os.path.exists(video_path):
-                    os.remove(video_path)
-                if os.path.exists(audio_path):
-                    os.remove(audio_path)
+                    # Clean up temp files
+                    try:
+                        if os.path.exists(video_path):
+                            os.remove(video_path)
+                        if os.path.exists(audio_path):
+                            os.remove(audio_path)
+                    except Exception as e:
+                        logger.error(f"Error removing temp files: {str(e)}")
+                else:
+                    raise Exception("Failed to download video or audio")
 
             else:
                 # Download specific format and merge with best audio
                 ydl_opts.update({
                     'format': f"{format_id}+bestaudio",
                     'merge_output_format': 'mp4',
-                    'final_filepath': output_path
                 })
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -300,7 +356,7 @@ def process_download(download_id, url, format_id=None, audio_id=None):
         else:
             # Download best quality and merge
             ydl_opts.update({
-                'format': 'bestvideo+bestaudio',
+                'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',  # Limit to 1080p to avoid huge downloads
                 'merge_output_format': 'mp4',
             })
 
@@ -323,8 +379,11 @@ def process_download(download_id, url, format_id=None, audio_id=None):
             "filename": output_filename,
             "completion_time": time.time()
         }
+        
+        logger.info(f"Download completed: {download_id} - {output_filename}")
 
     except Exception as e:
+        logger.error(f"Download failed {download_id}: {str(e)}")
         completed_downloads[download_id] = {
             "status": "failed",
             "url": url,
@@ -339,29 +398,37 @@ def process_download(download_id, url, format_id=None, audio_id=None):
 
 def download_specific_format(url, format_id, prefix):
     """Download specific format and return file path"""
-    temp_path = os.path.join(TEMP_FOLDER, f"{prefix}.mp4")
+    try:
+        temp_path = os.path.join(TEMP_FOLDER, f"{prefix}.mp4")
 
-    ydl_opts = get_base_ydl_opts()
-    ydl_opts.update({
-        'format': format_id,
-        'outtmpl': os.path.join(TEMP_FOLDER, f"{prefix}.%(ext)s"),
-    })
+        ydl_opts = get_base_ydl_opts()
+        ydl_opts.update({
+            'format': format_id,
+            'outtmpl': os.path.join(TEMP_FOLDER, f"{prefix}.%(ext)s"),
+        })
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url)
-        downloaded_file = ydl.prepare_filename(info)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url)
+            downloaded_file = ydl.prepare_filename(info)
 
-        # Find the actual downloaded file (extension might be different)
-        actual_file = downloaded_file
-        if not os.path.exists(actual_file):
-            # Try to find the file with different extensions
-            for ext in ['mp4', 'webm', 'mkv', 'm4a', 'mp3']:
-                candidate = downloaded_file.rsplit(".", 1)[0] + f".{ext}"
-                if os.path.exists(candidate):
-                    actual_file = candidate
-                    break
-
-    return actual_file
+            # Find the actual downloaded file (extension might be different)
+            actual_file = downloaded_file
+            if not os.path.exists(actual_file):
+                # Try to find the file with different extensions
+                for ext in ['mp4', 'webm', 'mkv', 'm4a', 'mp3']:
+                    candidate = downloaded_file.rsplit(".", 1)[0] + f".{ext}"
+                    if os.path.exists(candidate):
+                        actual_file = candidate
+                        break
+            
+            if not os.path.exists(actual_file):
+                logger.error(f"Downloaded file not found: {downloaded_file}")
+                return None
+                
+            return actual_file
+    except Exception as e:
+        logger.error(f"Error downloading specific format: {str(e)}")
+        return None
 
 def merge_video_audio(video_path, audio_path, output_path):
     """Merge video and audio files using ffmpeg"""
@@ -371,13 +438,18 @@ def merge_video_audio(video_path, audio_path, output_path):
         command = [
             'ffmpeg', '-i', video_path, '-i', audio_path,
             '-c:v', 'copy', '-c:a', 'aac', '-strict', 'experimental',
+            '-y',  # Overwrite output file if it exists
             output_path
         ]
 
-        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+        logger.info(f"Merged files successfully: {output_path}")
         return True
+    except subprocess.TimeoutExpired:
+        logger.error(f"Timeout merging files")
+        return False
     except Exception as e:
-        print(f"Error merging files: {e}")
+        logger.error(f"Error merging files: {e}")
         return False
 
 def update_progress(download_id, d):
@@ -396,12 +468,6 @@ def update_progress(download_id, d):
 def check_download_status(download_id):
     """
     Check the status of a download
-
-    Path parameters:
-    - download_id: ID of the download to check
-
-    Returns:
-    - Download status information
     """
     # Check if download is in progress
     if download_id in downloads_in_progress:
@@ -419,7 +485,8 @@ def check_download_status(download_id):
             "status": completed_downloads[download_id]["status"],
             "url": completed_downloads[download_id]["url"],
             "download_url": completed_downloads[download_id].get("download_url"),
-            "filename": completed_downloads[download_id].get("filename")
+            "filename": completed_downloads[download_id].get("filename"),
+            "error": completed_downloads[download_id].get("error")
         })
 
     return jsonify({"error": "Download ID not found"}), 404
@@ -428,12 +495,6 @@ def check_download_status(download_id):
 def get_downloaded_file(download_id):
     """
     Get a downloaded file
-
-    Path parameters:
-    - download_id: ID of the download to get
-
-    Returns:
-    - The downloaded file
     """
     if download_id in completed_downloads and completed_downloads[download_id]["status"] == "completed":
         file_path = completed_downloads[download_id]["file_path"]
@@ -447,120 +508,185 @@ def get_downloaded_file(download_id):
 @app.route('/api/direct-download/<video_id>/<format_id>', methods=['GET'])
 def direct_download(video_id, format_id):
     """
-    Direct download endpoint that combines video with best audio and sends the file
-
-    Path parameters:
-    - video_id: YouTube video ID
-    - format_id: Format ID to download
-
-    Query parameters:
-    - audio_id: (Optional) Specific audio format ID
-    - filename: (Optional) Custom filename for the download
-
-    Returns:
-    - The downloaded file directly to the browser
+    Direct download endpoint that streams the response
     """
     audio_id = request.args.get('audio_id')
     custom_filename = request.args.get('filename')
     url = f"https://www.youtube.com/watch?v={video_id}"
 
-    try:
-        # Create a unique filename based on video ID and format
-        cache_filename = f"{video_id}_{format_id}"
-        if audio_id:
-            cache_filename += f"_{audio_id}"
-        cache_filename += ".mp4"
-
-        output_path = os.path.join(DOWNLOAD_FOLDER, cache_filename)
-
-        # First get video info for better filename
-        ydl_opts = get_base_ydl_opts()
-        ydl_opts.update({
-            'quiet': True,
-            'skip_download': True,
-        })
-        
-        video_title = ""
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
+    # Check if a cached version exists
+    cache_filename = f"{video_id}_{format_id}"
+    if audio_id:
+        cache_filename += f"_{audio_id}"
+    cache_filename += ".mp4"
+    
+    cache_path = os.path.join(DOWNLOAD_FOLDER, cache_filename)
+    
+    if os.path.exists(cache_path):
+        # First get video info to make a better filename
+        try:
+            ydl_opts = get_base_ydl_opts()
+            ydl_opts.update({
+                'quiet': True,
+                'skip_download': True,
+            })
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-                video_title = info.get('title', '')
-                # Clean title for safe filename
+                video_title = info.get('title', video_id)
                 video_title = ''.join(c for c in video_title if c.isalnum() or c in ' ._-')
                 video_title = video_title.strip()
-            except:
-                video_title = video_id
+        except:
+            video_title = video_id
+        
+        download_name = custom_filename if custom_filename else f"VibeDownloader - {video_title}.mp4"
+        return send_file(cache_path, as_attachment=True, download_name=download_name)
+    
+    # If we're here, we need to start the download but without blocking
+    download_id = str(uuid.uuid4())
+    
+    # Create a status for this request
+    downloads_in_progress[download_id] = {
+        "status": "pending",
+        "progress": 0,
+        "url": url,
+        "start_time": time.time(),
+        "format_id": format_id,
+        "audio_id": audio_id,
+        "video_id": video_id,
+        "cache_path": cache_path,
+    }
+    
+    # Start a background download
+    thread = threading.Thread(
+        target=process_direct_download,
+        args=(download_id, url, format_id, audio_id, cache_path, video_id)
+    )
+    thread.daemon = True
+    thread.start()
+    
+    # Return a status page that will check and redirect when ready
+    response_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Download in Progress</title>
+        <meta http-equiv="refresh" content="5;url=/api/direct-download/{video_id}/{format_id}?audio_id={audio_id if audio_id else ''}">
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; text-align: center; }}
+            .progress-container {{ width: 80%; margin: 20px auto; background-color: #f3f3f3; border-radius: 5px; }}
+            .progress-bar {{ height: 30px; background-color: #4CAF50; width: 0%; border-radius: 5px; transition: width 0.5s; }}
+            .status {{ margin: 20px 0; }}
+        </style>
+        <script>
+            function checkStatus() {{
+                fetch('/api/download-status/{download_id}')
+                    .then(response => response.json())
+                    .then(data => {{
+                        if (data.status === "completed") {{
+                            window.location.href = "/api/get-file/{download_id}";
+                        }} else if (data.status === "failed") {{
+                            document.getElementById('status').innerHTML = "Download failed: " + (data.error || "Unknown error");
+                            document.getElementById('progress-bar').style.width = "100%";
+                            document.getElementById('progress-bar').style.backgroundColor = "#f44336";
+                        }} else {{
+                            document.getElementById('status').innerHTML = "Download in progress: " + data.progress.toFixed(1) + "%";
+                            document.getElementById('progress-bar').style.width = data.progress + "%";
+                            setTimeout(checkStatus, 1000);
+                        }}
+                    }});
+            }}
+            window.onload = function() {{
+                checkStatus();
+            }};
+        </script>
+    </head>
+    <body>
+        <h1>Preparing Your Download</h1>
+        <div class="progress-container">
+            <div class="progress-bar" id="progress-bar"></div>
+        </div>
+        <div class="status" id="status">Starting download...</div>
+        <p>Please wait while we prepare your download. This page will automatically refresh.</p>
+    </body>
+    </html>
+    """
+    
+    return Response(response_html, mimetype='text/html')
 
-        # Check if file already exists (cached)
-        if os.path.exists(output_path):
-            download_name = custom_filename if custom_filename else f"VibeDownloader - {video_title}.mp4"
-            return send_file(output_path, as_attachment=True, download_name=download_name)
-
+def process_direct_download(download_id, url, format_id, audio_id, cache_path, video_id):
+    """Process a direct download in the background"""
+    try:
         # Set up download options
         ydl_opts = get_base_ydl_opts()
-
-        # Add progress hooks
-        download_id = str(uuid.uuid4())
-        downloads_in_progress[download_id] = {
-            "status": "downloading",
-            "progress": 0,
-            "url": url,
-            "start_time": time.time()
-        }
-
         ydl_opts.update({
             'progress_hooks': [lambda d: update_progress(download_id, d)],
         })
 
-        # Always combine with best audio if format is video-only
+        # Set format string
+        if audio_id:
+            format_str = f"{format_id}+{audio_id}"
+        else:
+            format_str = f"{format_id}+bestaudio"
+            
         ydl_opts.update({
-            'format': f"{format_id}+bestaudio" if not audio_id else f"{format_id}+{audio_id}",
-            'outtmpl': output_path,
+            'format': format_str,
+            'outtmpl': cache_path,
             'merge_output_format': 'mp4',
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
         })
 
         # Download the file
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.extract_info(url)
-
-        # Get a user-friendly filename
-        download_name = custom_filename if custom_filename else f"VibeDownloader - {video_title}.mp4"
-
-        # Update downloads info and remove from in-progress
-        if download_id in downloads_in_progress:
-            downloads_in_progress.pop(download_id)
-
+            
+        # Get video title for a better filename
+        try:
+            ydl_opts = get_base_ydl_opts()
+            ydl_opts.update({
+                'quiet': True,
+                'skip_download': True,
+            })
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                video_title = info.get('title', video_id)
+                video_title = ''.join(c for c in video_title if c.isalnum() or c in ' ._-')
+                video_title = video_title.strip()
+        except:
+            video_title = video_id
+            
+        download_name = f"VibeDownloader - {video_title}.mp4"
+        
+        # Update downloads info
         completed_downloads[download_id] = {
             "status": "completed",
             "url": url,
-            "file_path": output_path,
+            "file_path": cache_path,
             "filename": download_name,
+            "completion_time": time.time(),
+            "download_url": f"/api/get-file/{download_id}",
+        }
+        
+        logger.info(f"Direct download completed: {download_id} - {download_name}")
+        
+    except Exception as e:
+        logger.error(f"Direct download failed {download_id}: {str(e)}")
+        completed_downloads[download_id] = {
+            "status": "failed",
+            "url": url,
+            "error": str(e),
             "completion_time": time.time()
         }
-
-        # Check if download was successful
-        if os.path.exists(output_path):
-            return send_file(output_path, as_attachment=True, download_name=download_name)
-        else:
-            return jsonify({"error": "Download failed"}), 500
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    
+    finally:
+        # Remove from in-progress
+        if download_id in downloads_in_progress:
+            downloads_in_progress.pop(download_id)
 
 @app.route('/api/upload-cookie', methods=['POST'])
 def upload_cookie():
     """
     Upload cookie.txt file
-
-    Form data:
-    - cookie_file: The cookie.txt file
-
-    Returns:
-    - Success or error message
     """
     if 'cookie_file' not in request.files:
         return jsonify({"error": "No file part"}), 400
@@ -582,7 +708,6 @@ def upload_cookie():
 def get_cookie_file():
     """
     Return cookie.txt file content or empty placeholder if not exists
-    Used to allow client-side checking if cookie file is present
     """
     if os.path.exists(COOKIE_FILE):
         with open(COOKIE_FILE, 'r') as f:
@@ -596,73 +721,292 @@ def health_check():
     """Simple health check endpoint"""
     return jsonify({
         "status": "ok",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "cookie_file_exists": os.path.exists(COOKIE_FILE),
         "downloads_folder_size_mb": get_folder_size(DOWNLOAD_FOLDER) / (1024 * 1024),
-        "temp_folder_size_mb": get_folder_size(TEMP_FOLDER) / (1024 * 1024)
+        "temp_folder_size_mb": get_folder_size(TEMP_FOLDER) / (1024 * 1024),
+        "active_downloads": len(downloads_in_progress),
+        "completed_downloads": len(completed_downloads),
+        "uptime_seconds": time.time() - app.config.get("start_time", time.time())
     })
 
 def get_folder_size(folder_path):
-    """Calculate the size of a folder in bytes"""
+    """Calculate total size of a folder in bytes"""
     total_size = 0
     for dirpath, dirnames, filenames in os.walk(folder_path):
         for f in filenames:
             fp = os.path.join(dirpath, f)
-            if os.path.isfile(fp):
+            if os.path.exists(fp):
                 total_size += os.path.getsize(fp)
     return total_size
 
-# Add a simple homepage
+@app.route('/api/clean-cache', methods=['POST'])
+def clean_cache():
+    """Manually clean cached files to free up space"""
+    try:
+        # Count files before cleaning
+        files_before = len(os.listdir(DOWNLOAD_FOLDER)) + len(os.listdir(TEMP_FOLDER))
+        size_before = get_folder_size(DOWNLOAD_FOLDER) + get_folder_size(TEMP_FOLDER)
+        
+        # Get active file paths to avoid deleting in-use files
+        active_files = []
+        for download_info in downloads_in_progress.values():
+            if "cache_path" in download_info:
+                active_files.append(download_info["cache_path"])
+        
+        for download_info in completed_downloads.values():
+            if "file_path" in download_info and time.time() - download_info.get("completion_time", 0) < 300:  # Keep files completed in last 5 minutes
+                active_files.append(download_info["file_path"])
+        
+        # Clean download folder
+        files_deleted = 0
+        for filename in os.listdir(DOWNLOAD_FOLDER):
+            file_path = os.path.join(DOWNLOAD_FOLDER, filename)
+            if file_path not in active_files and os.path.isfile(file_path):
+                try:
+                    os.remove(file_path)
+                    files_deleted += 1
+                except Exception as e:
+                    logger.error(f"Error deleting {file_path}: {e}")
+        
+        # Clean temp folder
+        for filename in os.listdir(TEMP_FOLDER):
+            file_path = os.path.join(TEMP_FOLDER, filename)
+            if file_path not in active_files and os.path.isfile(file_path):
+                try:
+                    os.remove(file_path)
+                    files_deleted += 1
+                except Exception as e:
+                    logger.error(f"Error deleting {file_path}: {e}")
+        
+        # Calculate savings
+        size_after = get_folder_size(DOWNLOAD_FOLDER) + get_folder_size(TEMP_FOLDER)
+        size_saved = size_before - size_after
+        
+        return jsonify({
+            "success": True,
+            "message": f"Cache cleaned successfully. Deleted {files_deleted} files.",
+            "space_saved_mb": size_saved / (1024 * 1024),
+            "current_size_mb": size_after / (1024 * 1024)
+        })
+    except Exception as e:
+        logger.error(f"Error cleaning cache: {e}")
+        return jsonify({"error": f"Error cleaning cache: {str(e)}"}), 500
+
+@app.route('/api/list-downloads', methods=['GET'])
+def list_downloads():
+    """List all in-progress and completed downloads"""
+    in_progress = []
+    for download_id, info in downloads_in_progress.items():
+        in_progress.append({
+            "download_id": download_id,
+            "status": info.get("status", "unknown"),
+            "progress": info.get("progress", 0),
+            "url": info.get("url", ""),
+            "elapsed_seconds": time.time() - info.get("start_time", time.time())
+        })
+    
+    completed = []
+    for download_id, info in completed_downloads.items():
+        completed.append({
+            "download_id": download_id,
+            "status": info.get("status", "unknown"),
+            "url": info.get("url", ""),
+            "filename": info.get("filename", ""),
+            "download_url": info.get("download_url", ""),
+            "completion_time": info.get("completion_time", 0),
+            "age_seconds": time.time() - info.get("completion_time", time.time())
+        })
+    
+    return jsonify({
+        "in_progress": in_progress,
+        "completed": completed
+    })
+
+@app.route('/api/cancel-download/<download_id>', methods=['POST'])
+def cancel_download(download_id):
+    """Cancel an in-progress download"""
+    if download_id in downloads_in_progress:
+        # Mark as cancelled in the completion dictionary
+        completed_downloads[download_id] = {
+            "status": "cancelled",
+            "url": downloads_in_progress[download_id].get("url", ""),
+            "error": "Download cancelled by user",
+            "completion_time": time.time()
+        }
+        
+        # Remove from in-progress
+        downloads_in_progress.pop(download_id)
+        
+        return jsonify({
+            "success": True,
+            "message": f"Download {download_id} cancelled successfully"
+        })
+    
+    return jsonify({"error": "Download not found or already completed"}), 404
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Get detailed stats about the service"""
+    # Calculate average download time for completed downloads
+    download_times = []
+    success_count = 0
+    failure_count = 0
+    
+    for info in completed_downloads.values():
+        if info.get("status") == "completed":
+            success_count += 1
+        elif info.get("status") == "failed":
+            failure_count += 1
+    
+    # Get memory usage
+    import psutil
+    try:
+        process = psutil.Process(os.getpid())
+        memory_usage = process.memory_info().rss / (1024 * 1024)  # Convert to MB
+    except:
+        memory_usage = 0
+    
+    return jsonify({
+        "service": {
+            "version": "1.2.0",
+            "uptime_seconds": time.time() - app.config.get("start_time", time.time()),
+            "memory_usage_mb": memory_usage
+        },
+        "storage": {
+            "downloads_folder_size_mb": get_folder_size(DOWNLOAD_FOLDER) / (1024 * 1024),
+            "temp_folder_size_mb": get_folder_size(TEMP_FOLDER) / (1024 * 1024),
+            "cookie_file_exists": os.path.exists(COOKIE_FILE)
+        },
+        "downloads": {
+            "active": len(downloads_in_progress),
+            "completed_success": success_count,
+            "completed_failed": failure_count,
+            "total_completed": len(completed_downloads)
+        }
+    })
+
 @app.route('/', methods=['GET'])
-def homepage():
-    """Simple homepage with API documentation"""
+def index():
+    """Serve a simple frontend for the API"""
     return """
+    <!DOCTYPE html>
     <html>
-        <head>
-            <title>VibeDownloader API</title>
-            <style>
-                body {
-                    font-family: Arial, sans-serif;
-                    line-height: 1.6;
-                    margin: 20px;
-                    max-width: 800px;
-                    margin: 0 auto;
-                    padding: 20px;
-                }
-                h1 {
-                    color: #333;
-                }
-                h2 {
-                    margin-top: 30px;
-                    color: #444;
-                }
-                code {
-                    background-color: #f4f4f4;
-                    padding: 2px 5px;
-                    border-radius: 4px;
-                }
-            </style>
-        </head>
-        <body>
-            <h1>VibeDownloader API</h1>
-            <p>A YouTube video downloader API service.</p>
-            
-            <h2>API Endpoints:</h2>
-            <ul>
-                <li><code>GET /api/video-info?url=YOUTUBE_URL</code> - Get video information</li>
-                <li><code>GET /api/download?url=YOUTUBE_URL&format_id=FORMAT_ID&audio_id=AUDIO_ID</code> - Start download</li>
-                <li><code>GET /api/download-status/DOWNLOAD_ID</code> - Check download status</li>
-                <li><code>GET /api/get-file/DOWNLOAD_ID</code> - Get downloaded file</li>
-                <li><code>GET /api/direct-download/VIDEO_ID/FORMAT_ID</code> - Direct download</li>
-                <li><code>POST /api/upload-cookie</code> - Upload cookie file</li>
-                <li><code>GET /cookie.txt</code> - Check cookie file status</li>
-                <li><code>GET /api/health</code> - API health check</li>
-            </ul>
-        </body>
+    <head>
+        <title>VibeDownloader API</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+                line-height: 1.6;
+                color: #333;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+            }
+            h1 {
+                color: #2a65a0;
+                border-bottom: 2px solid #eee;
+                padding-bottom: 10px;
+            }
+            .endpoint {
+                background: #f9f9f9;
+                border-left: 4px solid #2a65a0;
+                padding: 15px;
+                margin-bottom: 20px;
+            }
+            .method {
+                font-weight: bold;
+                color: #0a5e0a;
+            }
+            .url {
+                font-family: monospace;
+                background-color: #eee;
+                padding: 2px 5px;
+                border-radius: 3px;
+            }
+            .description {
+                margin-top: 10px;
+            }
+            footer {
+                margin-top: 40px;
+                color: #777;
+                font-size: 0.9em;
+                text-align: center;
+                border-top: 1px solid #eee;
+                padding-top: 20px;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>VibeDownloader API</h1>
+        <p>Welcome to the VibeDownloader API. Below are the available endpoints:</p>
+        
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/api/video-info?url={video_url}</span></div>
+            <div class="description">Get video information including available formats.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/api/download?url={video_url}&format_id={format_id}&audio_id={audio_id}</span></div>
+            <div class="description">Start a video download. Format ID and audio ID are optional.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/api/download-status/{download_id}</span></div>
+            <div class="description">Check the status of a download.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/api/get-file/{download_id}</span></div>
+            <div class="description">Download a completed file.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/api/direct-download/{video_id}/{format_id}?audio_id={audio_id}</span></div>
+            <div class="description">Direct download of a video with specified format. Audio ID is optional.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">POST</span> <span class="url">/api/upload-cookie</span></div>
+            <div class="description">Upload a cookie.txt file for authenticated downloads.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/api/health</span></div>
+            <div class="description">Health check endpoint.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">POST</span> <span class="url">/api/clean-cache</span></div>
+            <div class="description">Clean cached files to free up space.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/api/list-downloads</span></div>
+            <div class="description">List all in-progress and completed downloads.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">POST</span> <span class="url">/api/cancel-download/{download_id}</span></div>
+            <div class="description">Cancel an in-progress download.</div>
+        </div>
+        
+        <div class="endpoint">
+            <div><span class="method">GET</span> <span class="url">/api/stats</span></div>
+            <div class="description">Get detailed stats about the service.</div>
+        </div>
+        
+        <footer>
+            VibeDownloader API v1.2.0
+        </footer>
+    </body>
     </html>
     """
-    
-# Entry point for Koyeb
-if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+
+# Store start time for uptime tracking
+app.config["start_time"] = time.time()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
