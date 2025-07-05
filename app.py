@@ -29,7 +29,7 @@ def cleanup_old_files():
     while True:
         try:
             now = time.time()
-            # Delete files older than 30 minutes (more aggressive due to limited storage)
+            # Delete files older than 30 minutes
             for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
                 if os.path.exists(folder):
                     for filename in os.listdir(folder):
@@ -64,8 +64,7 @@ def get_base_ydl_opts():
         'quiet': True,
         'no_warnings': True,
         'ignoreerrors': True,
-        # Add format selection to reduce file sizes
-        'format': 'best[height<=720]',  # Limit to 720p max to save resources
+        # Remove format restriction to get all available formats
     }
 
     if os.path.exists(COOKIE_FILE):
@@ -80,6 +79,17 @@ def get_verification_status(channel_data):
         if badge and isinstance(badge, dict) and 'verified' in badge.get('type', '').lower():
             return True
     return False
+
+def format_filesize(size):
+    """Convert filesize to human readable format"""
+    if not size:
+        return "Unknown"
+    
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
 
 @app.route('/api/video-info', methods=['GET'])
 def get_video_info():
@@ -99,12 +109,12 @@ def get_video_info():
             result = {
                 "id": video_id,
                 "title": info.get('title'),
-                "description": info.get('description')[:500] if info.get('description') else None,  # Limit description
+                "description": info.get('description')[:1000] if info.get('description') else None,
                 "duration": info.get('duration'),
                 "view_count": info.get('view_count'),
                 "like_count": info.get('like_count'),
                 "upload_date": info.get('upload_date'),
-                "thumbnails": info.get('thumbnails', [])[:3],  # Limit thumbnails
+                "thumbnails": info.get('thumbnails', []),
                 "channel": {
                     "id": info.get('channel_id'),
                     "name": info.get('channel', info.get('uploader')),
@@ -116,43 +126,89 @@ def get_video_info():
                 "video_formats": []
             }
 
-            # Extract audio formats (limit to reasonable quality)
+            # Try to extract channel profile picture
+            for thumbnail in info.get('thumbnails', []):
+                if 'url' in thumbnail and 'avatar' in thumbnail.get('id', ''):
+                    result['channel']['profile_picture'] = thumbnail['url']
+                    break
+
+            # Extract and categorize formats
+            formats = info.get('formats', [])
+            
+            # Audio-only formats
             audio_formats = []
-            for format in info.get('formats', []):
-                if (format.get('vcodec') == 'none' and 
-                    format.get('acodec') != 'none' and 
-                    format.get('abr', 0) <= 128):  # Limit audio bitrate
-                    audio_formats.append({
-                        "format_id": format.get('format_id'),
-                        "ext": format.get('ext'),
-                        "filesize": format.get('filesize'),
-                        "format_note": format.get('format_note'),
-                        "abr": format.get('abr'),
-                        "download_url": f"/api/direct-download/{video_id}/{format.get('format_id')}"
-                    })
-
-            result["audio_formats"] = audio_formats[:5]  # Limit number of formats
-
-            # Extract video formats (limit to reasonable quality)
+            # Video formats (including video+audio combined)
             video_formats = []
-            for format in info.get('formats', []):
-                if (format.get('vcodec') != 'none' and 
-                    format.get('height', 0) <= 720):  # Limit to 720p max
+            
+            for fmt in formats:
+                format_id = fmt.get('format_id')
+                if not format_id:
+                    continue
+                
+                # Check if it's audio-only
+                if fmt.get('vcodec') == 'none' and fmt.get('acodec') != 'none':
+                    audio_formats.append({
+                        "format_id": format_id,
+                        "ext": fmt.get('ext'),
+                        "filesize": fmt.get('filesize'),
+                        "filesize_human": format_filesize(fmt.get('filesize')),
+                        "format_note": fmt.get('format_note', ''),
+                        "abr": fmt.get('abr'),
+                        "acodec": fmt.get('acodec'),
+                        "quality": fmt.get('quality'),
+                        "download_url": f"/api/direct-download/{video_id}/{format_id}"
+                    })
+                
+                # Check if it's video (with or without audio)
+                elif fmt.get('vcodec') != 'none':
+                    # Determine quality label
+                    height = fmt.get('height')
+                    quality_label = "Unknown"
+                    if height:
+                        if height <= 144:
+                            quality_label = "144p"
+                        elif height <= 240:
+                            quality_label = "240p"
+                        elif height <= 360:
+                            quality_label = "360p"
+                        elif height <= 480:
+                            quality_label = "480p"
+                        elif height <= 720:
+                            quality_label = "720p (HD)"
+                        elif height <= 1080:
+                            quality_label = "1080p (Full HD)"
+                        elif height <= 1440:
+                            quality_label = "1440p (2K)"
+                        elif height <= 2160:
+                            quality_label = "2160p (4K)"
+                        elif height <= 4320:
+                            quality_label = "4320p (8K)"
+                        else:
+                            quality_label = f"{height}p"
+                    
                     video_formats.append({
-                        "format_id": format.get('format_id'),
-                        "ext": format.get('ext'),
-                        "filesize": format.get('filesize'),
-                        "format_note": format.get('format_note'),
-                        "width": format.get('width'),
-                        "height": format.get('height'),
-                        "fps": format.get('fps'),
-                        "vcodec": format.get('vcodec'),
-                        "acodec": format.get('acodec'),
-                        "download_url": f"/api/direct-download/{video_id}/{format.get('format_id')}",
-                        "resolution": f"{format.get('width', 0)}x{format.get('height', 0)}"
+                        "format_id": format_id,
+                        "ext": fmt.get('ext'),
+                        "filesize": fmt.get('filesize'),
+                        "filesize_human": format_filesize(fmt.get('filesize')),
+                        "format_note": fmt.get('format_note', ''),
+                        "width": fmt.get('width'),
+                        "height": height,
+                        "fps": fmt.get('fps'),
+                        "vcodec": fmt.get('vcodec'),
+                        "acodec": fmt.get('acodec'),
+                        "quality_label": quality_label,
+                        "has_audio": fmt.get('acodec') != 'none',
+                        "download_url": f"/api/direct-download/{video_id}/{format_id}",
+                        "resolution": f"{fmt.get('width', 0)}x{fmt.get('height', 0)}"
                     })
 
-            result["video_formats"] = video_formats[:5]  # Limit number of formats
+            # Sort formats by quality
+            audio_formats.sort(key=lambda x: x.get('abr', 0) or 0, reverse=True)
+            video_formats.sort(key=lambda x: x.get('height', 0) or 0, reverse=True)
+
+            result["audio_formats"] = audio_formats
+            result["video_formats"] = video_formats
 
             return jsonify(result)
 
@@ -161,7 +217,7 @@ def get_video_info():
 
 @app.route('/api/download', methods=['GET'])
 def download_video():
-    """Download a video with resource limits"""
+    """Download a video with audio combined"""
     url = request.args.get('url')
     format_id = request.args.get('format_id')
     audio_id = request.args.get('audio_id')
@@ -182,12 +238,12 @@ def download_video():
     return jsonify({
         "download_id": download_id,
         "status": "processing",
-        "message": "Download started. Check status using the /api/download-status endpoint.",
+        "message": "Download started. Video will be combined with audio automatically.",
         "note": "Files are temporarily stored and will be deleted after 30 minutes."
     })
 
 def process_download(download_id, url, format_id=None, audio_id=None):
-    """Process video download with resource limits"""
+    """Process video download with audio combination"""
     downloads_in_progress[download_id] = {
         "status": "downloading",
         "progress": 0,
@@ -199,45 +255,59 @@ def process_download(download_id, url, format_id=None, audio_id=None):
         output_filename = f"{download_id}.mp4"
         output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
 
-        # Configure yt-dlp options with resource limits
+        # Configure yt-dlp options
         ydl_opts = get_base_ydl_opts()
         ydl_opts.update({
-            'outtmpl': os.path.join(TEMP_FOLDER, f"{download_id}_%(title)s.%(ext)s"),
+            'outtmpl': output_path,
             'progress_hooks': [lambda d: update_progress(download_id, d)],
-            'format': 'best[height<=720]',  # Limit quality
         })
 
-        # Simplified download logic
-        if format_id:
-            ydl_opts.update({
-                'format': f"{format_id}+bestaudio/best",
-                'merge_output_format': 'mp4',
-            })
+        # Determine format selection
+        if format_id and audio_id:
+            # Specific video + specific audio
+            ydl_opts['format'] = f"{format_id}+{audio_id}"
+        elif format_id:
+            # Specific video + best audio
+            ydl_opts['format'] = f"{format_id}+bestaudio/best"
+        elif audio_id:
+            # Audio only
+            ydl_opts['format'] = audio_id
+        else:
+            # Best video + best audio
+            ydl_opts['format'] = 'bestvideo+bestaudio/best'
+
+        # Always merge to mp4 for video downloads
+        if not audio_id or format_id:
+            ydl_opts['merge_output_format'] = 'mp4'
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url)
-            downloaded_file = ydl.prepare_filename(info)
+            ydl.download([url])
 
-            # Find the actual downloaded file
-            actual_file = None
-            for ext in ['mp4', 'webm', 'mkv']:
-                candidate = downloaded_file.rsplit(".", 1)[0] + f".{ext}"
-                if os.path.exists(candidate):
-                    actual_file = candidate
+        # Check if file was created
+        if os.path.exists(output_path):
+            completed_downloads[download_id] = {
+                "status": "completed",
+                "url": url,
+                "file_path": output_path,
+                "download_url": f"/api/get-file/{download_id}",
+                "completion_time": time.time()
+            }
+        else:
+            # Try to find the file with different naming
+            for file in os.listdir(DOWNLOAD_FOLDER):
+                if file.startswith(download_id):
+                    old_path = os.path.join(DOWNLOAD_FOLDER, file)
+                    os.rename(old_path, output_path)
+                    completed_downloads[download_id] = {
+                        "status": "completed",
+                        "url": url,
+                        "file_path": output_path,
+                        "download_url": f"/api/get-file/{download_id}",
+                        "completion_time": time.time()
+                    }
                     break
-
-            if actual_file and os.path.exists(actual_file):
-                # Move to downloads folder
-                os.rename(actual_file, output_path)
-
-        # Update download info
-        completed_downloads[download_id] = {
-            "status": "completed",
-            "url": url,
-            "file_path": output_path,
-            "download_url": f"/api/get-file/{download_id}",
-            "completion_time": time.time()
-        }
+            else:
+                raise Exception("Download completed but file not found")
 
     except Exception as e:
         completed_downloads[download_id] = {
@@ -257,7 +327,9 @@ def update_progress(download_id, d):
     if download_id in downloads_in_progress:
         if d['status'] == 'downloading':
             try:
-                downloads_in_progress[download_id]['progress'] = float(d.get('_percent_str', '0%').replace('%', ''))
+                percent_str = d.get('_percent_str', '0%')
+                if percent_str:
+                    downloads_in_progress[download_id]['progress'] = float(percent_str.replace('%', '').strip())
             except:
                 pass
         elif d['status'] == 'finished':
@@ -300,41 +372,84 @@ def get_downloaded_file(download_id):
 
 @app.route('/api/direct-download/<video_id>/<format_id>', methods=['GET'])
 def direct_download(video_id, format_id):
-    """Direct download with resource limits"""
+    """Direct download with automatic audio combination"""
+    audio_id = request.args.get('audio_id')
     custom_filename = request.args.get('filename')
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     try:
-        filename = f"{video_id}_{format_id}.mp4"
+        # Create filename based on parameters
+        if audio_id:
+            filename = f"{video_id}_{format_id}_{audio_id}.mp4"
+        else:
+            filename = f"{video_id}_{format_id}.mp4"
+        
         output_path = os.path.join(DOWNLOAD_FOLDER, filename)
 
-        # Check if file already exists
+        # Check if file already exists (cached)
         if os.path.exists(output_path):
             download_name = custom_filename if custom_filename else f"{video_id}.mp4"
             return send_file(output_path, as_attachment=True, download_name=download_name)
 
-        # Download with limits
+        # Set up download options
         ydl_opts = get_base_ydl_opts()
         ydl_opts.update({
-            'format': f"{format_id}+bestaudio/best[height<=720]",
             'outtmpl': output_path,
-            'merge_output_format': 'mp4',
         })
 
+        # Determine format - always try to combine with audio for video formats
+        if audio_id:
+            ydl_opts['format'] = f"{format_id}+{audio_id}"
+        else:
+            # Check if this is an audio-only format
+            with yt_dlp.YoutubeDL(get_base_ydl_opts()) as temp_ydl:
+                info = temp_ydl.extract_info(url, download=False)
+                target_format = None
+                for fmt in info.get('formats', []):
+                    if fmt.get('format_id') == format_id:
+                        target_format = fmt
+                        break
+                
+                if target_format:
+                    if target_format.get('vcodec') == 'none':
+                        # Audio only format
+                        ydl_opts['format'] = format_id
+                    else:
+                        # Video format - combine with best audio
+                        ydl_opts['format'] = f"{format_id}+bestaudio/best"
+                        ydl_opts['merge_output_format'] = 'mp4'
+
+        # Download the file
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url)
             
+            # Get the actual title for filename
             if not custom_filename and info.get('title'):
                 video_title = info.get('title')
-                video_title = ''.join(c for c in video_title if c.isalnum() or c in ' ._-')[:50]  # Limit length
-                download_name = f"{video_title}.mp4"
+                # Clean the title for use as filename
+                video_title = ''.join(c for c in video_title if c.isalnum() or c in ' ._-')[:100]
+                # Add extension based on format
+                if target_format and target_format.get('vcodec') == 'none':
+                    # Audio format
+                    ext = target_format.get('ext', 'mp3')
+                    download_name = f"{video_title}.{ext}"
+                else:
+                    # Video format
+                    download_name = f"{video_title}.mp4"
             else:
                 download_name = custom_filename if custom_filename else f"{video_id}.mp4"
 
+        # Check if download was successful
         if os.path.exists(output_path):
             return send_file(output_path, as_attachment=True, download_name=download_name)
         else:
-            return jsonify({"error": "Download failed"}), 500
+            # Try to find the file with different naming
+            for file in os.listdir(DOWNLOAD_FOLDER):
+                if file.startswith(video_id) and format_id in file:
+                    file_path = os.path.join(DOWNLOAD_FOLDER, file)
+                    return send_file(file_path, as_attachment=True, download_name=download_name)
+            
+            return jsonify({"error": "Download failed - file not found"}), 500
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -361,25 +476,40 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "ok",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "platform": "render",
         "cookie_file_exists": os.path.exists(COOKIE_FILE),
-        "storage_info": "Ephemeral storage - files deleted after 30 minutes"
+        "storage_info": "Ephemeral storage - files deleted after 30 minutes",
+        "features": [
+            "All video qualities (144p to 8K)",
+            "Audio-only formats",
+            "Automatic video+audio combination",
+            "Format caching"
+        ]
     })
 
 @app.route('/', methods=['GET'])
 def root():
     """Root endpoint"""
     return jsonify({
-        "message": "YouTube Downloader API",
-        "version": "1.0.0",
+        "message": "YouTube Downloader API v2.0",
+        "description": "Supports all video qualities and automatic audio combination",
+        "version": "2.0.0",
         "endpoints": [
             "/api/health",
             "/api/video-info",
             "/api/download",
             "/api/download-status/<id>",
             "/api/get-file/<id>",
-            "/api/direct-download/<video_id>/<format_id>"
+            "/api/direct-download/<video_id>/<format_id>",
+            "/api/upload-cookie"
+        ],
+        "features": [
+            "144p to 8K video quality support",
+            "Audio-only downloads",
+            "Automatic video+audio combination",
+            "Progress tracking",
+            "File caching"
         ]
     })
 
