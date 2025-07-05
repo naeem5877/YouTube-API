@@ -1,3 +1,5 @@
+to upload cookie "curl -X POST -F "cookie_file=@cookie.txt" https://ytapi.vibedownloader.me/api/upload-cookie""
+
 from flask import Flask, request, jsonify, send_file
 import yt_dlp
 import os
@@ -5,16 +7,16 @@ import uuid
 import threading
 import time
 import json
-import shutil
 from werkzeug.utils import secure_filename
+from flask_cors import CORS  # Import the CORS package
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "https://vibedownloader.vercel.app", "https://vibedownloader.me", "https://www.vibedownloader.me", "https://ytapi.vibedownloader.me/"]}})  # Enable CORS for all routes
 
 # Configuration
-BASE_DIR = os.environ.get('STORAGE_PATH', os.getcwd())
-DOWNLOAD_FOLDER = os.path.join(BASE_DIR, "downloads")
-COOKIE_FILE = os.path.join(BASE_DIR, "cookie.txt")
-TEMP_FOLDER = os.path.join(BASE_DIR, "temp")
+DOWNLOAD_FOLDER = os.path.join(os.getcwd(), "downloads")
+COOKIE_FILE = os.path.join(os.getcwd(), "cookie.txt")
+TEMP_FOLDER = os.path.join(os.getcwd(), "temp")
 
 # Create necessary directories
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
@@ -28,66 +30,30 @@ completed_downloads = {}
 def cleanup_old_files():
     while True:
         now = time.time()
-        
+        # Delete files older than 2 hours
+        for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
+            for filename in os.listdir(folder):
+                file_path = os.path.join(folder, filename)
+                if os.path.isfile(file_path) and now - os.path.getmtime(file_path) > 7200:  # 2 hours
+                    try:
+                        os.remove(file_path)
+                    except Exception as e:
+                        print(f"Error deleting {file_path}: {e}")
+
         # Clean up completed downloads dictionary
         to_remove = []
         for download_id, info in completed_downloads.items():
-            if now - info.get("completion_time", 0) > 3600:  # 1 hour (reduced from 2 hours)
+            if now - info.get("completion_time", 0) > 7200:  # 2 hours
                 to_remove.append(download_id)
-                # Delete associated download folder if it exists
-                user_download_dir = os.path.join(DOWNLOAD_FOLDER, download_id)
-                if os.path.exists(user_download_dir) and os.path.isdir(user_download_dir):
-                    try:
-                        shutil.rmtree(user_download_dir)
-                        print(f"Cleaned up download folder for {download_id}")
-                    except Exception as e:
-                        print(f"Error deleting download folder {user_download_dir}: {e}")
 
         for download_id in to_remove:
             completed_downloads.pop(download_id, None)
 
-        # Clean up temp folder - delete files older than 30 minutes
-        for filename in os.listdir(TEMP_FOLDER):
-            file_path = os.path.join(TEMP_FOLDER, filename)
-            if os.path.isfile(file_path) and now - os.path.getmtime(file_path) > 1800:  # 30 minutes
-                try:
-                    os.remove(file_path)
-                    print(f"Cleaned up temp file: {filename}")
-                except Exception as e:
-                    print(f"Error deleting {file_path}: {e}")
-
-        # Find and clean up abandoned download directories (older than 2 hours)
-        for item in os.listdir(DOWNLOAD_FOLDER):
-            item_path = os.path.join(DOWNLOAD_FOLDER, item)
-            if os.path.isdir(item_path) and now - os.path.getmtime(item_path) > 7200:  # 2 hours
-                try:
-                    shutil.rmtree(item_path)
-                    print(f"Cleaned up abandoned download folder: {item}")
-                except Exception as e:
-                    print(f"Error deleting abandoned folder {item_path}: {e}")
-
-        time.sleep(1800)  # Check every 30 minutes (reduced from 1 hour)
+        time.sleep(3600)  # Check every hour
 
 # Start cleanup thread
 cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
-
-def load_cookie_file():
-    """Check if cookie file exists in git-stored location and copy to working directory"""
-    git_cookie_path = os.environ.get('GIT_COOKIE_PATH', os.path.join(os.getcwd(), 'git-resources', 'cookie.txt'))
-    
-    if os.path.exists(git_cookie_path) and not os.path.exists(COOKIE_FILE):
-        try:
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(COOKIE_FILE), exist_ok=True)
-            # Copy the file
-            shutil.copyfile(git_cookie_path, COOKIE_FILE)
-            print(f"Cookie file copied from {git_cookie_path} to {COOKIE_FILE}")
-            return True
-        except Exception as e:
-            print(f"Error copying cookie file: {e}")
-            return False
-    return os.path.exists(COOKIE_FILE)
 
 def get_base_ydl_opts():
     """Return base yt-dlp options with cookie file if exists"""
@@ -97,10 +63,7 @@ def get_base_ydl_opts():
         'ignoreerrors': True,
     }
 
-    # Try to load cookie file from git repository location
-    cookie_exists = load_cookie_file()
-    
-    if cookie_exists:
+    if os.path.exists(COOKIE_FILE):
         ydl_opts['cookiefile'] = COOKIE_FILE
 
     return ydl_opts
@@ -113,12 +76,6 @@ def get_verification_status(channel_data):
         if badge and isinstance(badge, dict) and 'verified' in badge.get('type', '').lower():
             return True
     return False
-
-def create_user_download_dir(download_id):
-    """Create a user-specific download directory and return the path"""
-    user_dir = os.path.join(DOWNLOAD_FOLDER, download_id)
-    os.makedirs(user_dir, exist_ok=True)
-    return user_dir
 
 @app.route('/api/video-info', methods=['GET'])
 def get_video_info():
@@ -230,14 +187,11 @@ def download_video():
         return jsonify({"error": "Missing video URL"}), 400
 
     download_id = str(uuid.uuid4())
-    
-    # Create user-specific download directory
-    user_download_dir = create_user_download_dir(download_id)
 
     # Start download in background
     thread = threading.Thread(
         target=process_download,
-        args=(download_id, url, format_id, audio_id, user_download_dir)
+        args=(download_id, url, format_id, audio_id)
     )
     thread.daemon = True
     thread.start()
@@ -248,7 +202,7 @@ def download_video():
         "message": "Download started. Check status using the /api/download-status endpoint."
     })
 
-def process_download(download_id, url, format_id=None, audio_id=None, user_download_dir=None):
+def process_download(download_id, url, format_id=None, audio_id=None):
     """Process video download and merging in background"""
     downloads_in_progress[download_id] = {
         "status": "downloading",
@@ -259,7 +213,7 @@ def process_download(download_id, url, format_id=None, audio_id=None, user_downl
 
     try:
         output_filename = f"{download_id}.mp4"
-        output_path = os.path.join(user_download_dir, output_filename)
+        output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
 
         # Configure yt-dlp options
         ydl_opts = get_base_ydl_opts()
@@ -296,7 +250,7 @@ def process_download(download_id, url, format_id=None, audio_id=None, user_downl
                     info = ydl.extract_info(url)
                     downloaded_file = ydl.prepare_filename(info)
 
-                    # Move to user downloads folder with proper name
+                    # Move to downloads folder with proper name
                     if downloaded_file and os.path.exists(downloaded_file):
                         os.rename(downloaded_file, output_path)
                     elif downloaded_file and os.path.exists(downloaded_file.rsplit(".", 1)[0] + ".mp4"):
@@ -312,7 +266,7 @@ def process_download(download_id, url, format_id=None, audio_id=None, user_downl
                 info = ydl.extract_info(url)
                 downloaded_file = ydl.prepare_filename(info)
 
-                # Move to user downloads folder with proper name
+                # Move to downloads folder with proper name
                 if downloaded_file and os.path.exists(downloaded_file):
                     os.rename(downloaded_file, output_path)
                 elif downloaded_file and os.path.exists(downloaded_file.rsplit(".", 1)[0] + ".mp4"):
@@ -324,8 +278,7 @@ def process_download(download_id, url, format_id=None, audio_id=None, user_downl
             "url": url,
             "file_path": output_path,
             "download_url": f"/api/get-file/{download_id}",
-            "completion_time": time.time(),
-            "download_dir": user_download_dir
+            "completion_time": time.time()
         }
 
     except Exception as e:
@@ -333,8 +286,7 @@ def process_download(download_id, url, format_id=None, audio_id=None, user_downl
             "status": "failed",
             "url": url,
             "error": str(e),
-            "completion_time": time.time(),
-            "download_dir": user_download_dir
+            "completion_time": time.time()
         }
 
     finally:
@@ -428,44 +380,6 @@ def check_download_status(download_id):
 
     return jsonify({"error": "Download ID not found"}), 404
 
-@app.route('/api/cancel-download/<download_id>', methods=['GET'])
-def cancel_download(download_id):
-    """
-    Cancel a download in progress
-
-    Path parameters:
-    - download_id: ID of the download to cancel
-
-    Returns:
-    - Success or error message
-    """
-    if download_id in downloads_in_progress:
-        # Mark as canceled in the completed_downloads dict
-        downloads_in_progress[download_id]["status"] = "canceling"
-        completed_downloads[download_id] = {
-            "status": "canceled",
-            "url": downloads_in_progress[download_id]["url"],
-            "completion_time": time.time()
-        }
-        
-        # Remove from in-progress
-        downloads_in_progress.pop(download_id, None)
-        
-        # Clean up user download directory
-        user_download_dir = os.path.join(DOWNLOAD_FOLDER, download_id)
-        if os.path.exists(user_download_dir) and os.path.isdir(user_download_dir):
-            try:
-                shutil.rmtree(user_download_dir)
-            except Exception as e:
-                print(f"Error deleting download directory: {e}")
-                
-        return jsonify({"success": True, "message": "Download canceled successfully"})
-    
-    elif download_id in completed_downloads:
-        return jsonify({"error": "Download already completed or failed, cannot cancel"}), 400
-    
-    return jsonify({"error": "Download ID not found"}), 404
-
 @app.route('/api/get-file/<download_id>', methods=['GET'])
 def get_downloaded_file(download_id):
     """
@@ -482,10 +396,6 @@ def get_downloaded_file(download_id):
 
         if os.path.exists(file_path):
             filename = os.path.basename(file_path)
-            
-            # Set the completion time to current time to prevent premature cleanup
-            completed_downloads[download_id]["completion_time"] = time.time()
-            
             return send_file(file_path, as_attachment=True, download_name=filename)
 
     return jsonify({"error": "File not found"}), 404
@@ -511,22 +421,24 @@ def direct_download(video_id, format_id):
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     try:
-        # Create a unique download ID and user directory
-        download_id = str(uuid.uuid4())
-        user_download_dir = create_user_download_dir(download_id)
-        
         # Create a unique filename based on video ID and format
         filename = f"{video_id}_{format_id}"
         if audio_id:
             filename += f"_{audio_id}"
         filename += ".mp4"
 
-        output_path = os.path.join(user_download_dir, filename)
+        output_path = os.path.join(DOWNLOAD_FOLDER, filename)
+
+        # Check if file already exists (cached)
+        if os.path.exists(output_path):
+            download_name = custom_filename if custom_filename else f"{video_id}.mp4"
+            return send_file(output_path, as_attachment=True, download_name=download_name)
 
         # Set up download options
         ydl_opts = get_base_ydl_opts()
 
         # Add progress hooks
+        download_id = str(uuid.uuid4())
         downloads_in_progress[download_id] = {
             "status": "downloading",
             "progress": 0,
@@ -570,16 +482,12 @@ def direct_download(video_id, format_id):
             "status": "completed",
             "url": url,
             "file_path": output_path,
-            "download_dir": user_download_dir,
             "completion_time": time.time()
         }
 
         # Check if download was successful
         if os.path.exists(output_path):
-            # Send file and update completion time to prevent premature cleanup
-            response = send_file(output_path, as_attachment=True, download_name=download_name)
-            completed_downloads[download_id]["completion_time"] = time.time()
-            return response
+            return send_file(output_path, as_attachment=True, download_name=download_name)
         else:
             return jsonify({"error": "Download failed"}), 500
 
@@ -607,7 +515,7 @@ def upload_cookie():
 
     try:
         filename = secure_filename(file.filename)
-        file_path = COOKIE_FILE
+        file_path = os.path.join(os.getcwd(), "cookie.txt")
         file.save(file_path)
         return jsonify({"success": True, "message": "Cookie file uploaded successfully"})
     except Exception as e:
@@ -616,19 +524,12 @@ def upload_cookie():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Simple health check endpoint"""
-    cookie_status = load_cookie_file()
-    
     return jsonify({
         "status": "ok",
         "version": "1.0.0",
-        "cookie_file_exists": cookie_status,
-        "downloads_in_progress": len(downloads_in_progress),
-        "completed_downloads": len(completed_downloads),
-        "storage_path": BASE_DIR
+        "cookie_file_exists": os.path.exists(COOKIE_FILE)
     })
 
-# Render and Koyeb specific configuration
 if __name__ == '__main__':
-    # Get port from environment variable for Render/Koyeb compatibility
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    # For Replit, use this configuration
+    app.run(host='0.0.0.0', port=8080)
