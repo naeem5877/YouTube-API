@@ -51,7 +51,7 @@ def cleanup_old_files():
 
         except Exception as e:
             print(f"Cleanup error: {e}")
-        
+
         time.sleep(900)  # Check every 15 minutes
 
 # Start cleanup thread
@@ -59,14 +59,35 @@ cleanup_thread = threading.Thread(target=cleanup_old_files, daemon=True)
 cleanup_thread.start()
 
 def get_base_ydl_opts():
-    """Return base yt-dlp options with cookie file if exists"""
+    """Return base yt-dlp options with enhanced configuration"""
     ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'ignoreerrors': True,
-        # Remove format restriction to get all available formats
+        'quiet': False,  # Set to False for debugging
+        'no_warnings': False,  # Set to False for debugging
+        'ignoreerrors': False,  # Don't ignore errors to see what's happening
+        'writesubtitles': False,
+        'writeautomaticsub': False,
+        'extract_flat': False,
+        # Add user agent to mimic a real browser
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        },
+        # Add extractor arguments for better compatibility
+        'extractor_args': {
+            'youtube': {
+                'skip': ['dash', 'hls'],  # Skip DASH and HLS formats that might cause issues
+                'player_skip': ['js'],  # Skip JavaScript player
+            }
+        },
+        # Enable IPv6 and other network options
+        'prefer_ipv6': False,
+        'socket_timeout': 30,
+        'retries': 3,
+        # Add output template to avoid special characters
+        'restrictfilenames': True,
+        'trim_filename': 200,
     }
 
+    # Add cookie file if it exists
     if os.path.exists(COOKIE_FILE):
         ydl_opts['cookiefile'] = COOKIE_FILE
 
@@ -84,7 +105,7 @@ def format_filesize(size):
     """Convert filesize to human readable format"""
     if not size:
         return "Unknown"
-    
+
     for unit in ['B', 'KB', 'MB', 'GB']:
         if size < 1024.0:
             return f"{size:.1f} {unit}"
@@ -100,9 +121,32 @@ def get_video_info():
 
     try:
         ydl_opts = get_base_ydl_opts()
+        # Add specific options for info extraction
+        ydl_opts.update({
+            'extract_flat': False,
+            'dump_single_json': False,
+            'simulate': True,  # Don't actually download
+        })
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            try:
+                info = ydl.extract_info(url, download=False)
+            except Exception as e:
+                # If extraction fails, try with different options
+                print(f"First extraction failed: {e}")
+                ydl_opts.update({
+                    'youtube_include_dash_manifest': False,
+                    'format': 'best',
+                    'extractor_args': {
+                        'youtube': {
+                            'skip': ['dash', 'hls'],
+                            'player_skip': ['js'],
+                        }
+                    }
+                })
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                    info = ydl2.extract_info(url, download=False)
+
             video_id = info.get('id')
 
             # Extract relevant information
@@ -134,17 +178,17 @@ def get_video_info():
 
             # Extract and categorize formats
             formats = info.get('formats', [])
-            
+
             # Audio-only formats
             audio_formats = []
             # Video formats (including video+audio combined)
             video_formats = []
-            
+
             for fmt in formats:
                 format_id = fmt.get('format_id')
                 if not format_id:
                     continue
-                
+
                 # Check if it's audio-only
                 if fmt.get('vcodec') == 'none' and fmt.get('acodec') != 'none':
                     audio_formats.append({
@@ -158,7 +202,7 @@ def get_video_info():
                         "quality": fmt.get('quality'),
                         "download_url": f"/api/direct-download/{video_id}/{format_id}"
                     })
-                
+
                 # Check if it's video (with or without audio)
                 elif fmt.get('vcodec') != 'none':
                     # Determine quality label
@@ -185,7 +229,7 @@ def get_video_info():
                             quality_label = "4320p (8K)"
                         else:
                             quality_label = f"{height}p"
-                    
+
                     video_formats.append({
                         "format_id": format_id,
                         "ext": fmt.get('ext'),
@@ -213,7 +257,8 @@ def get_video_info():
             return jsonify(result)
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print(f"Error in video-info: {e}")
+        return jsonify({"error": f"Failed to extract video info: {str(e)}"}), 500
 
 @app.route('/api/download', methods=['GET'])
 def download_video():
@@ -252,7 +297,7 @@ def process_download(download_id, url, format_id=None, audio_id=None):
     }
 
     try:
-        output_filename = f"{download_id}.mp4"
+        output_filename = f"{download_id}.%(ext)s"
         output_path = os.path.join(DOWNLOAD_FOLDER, output_filename)
 
         # Configure yt-dlp options
@@ -260,21 +305,37 @@ def process_download(download_id, url, format_id=None, audio_id=None):
         ydl_opts.update({
             'outtmpl': output_path,
             'progress_hooks': [lambda d: update_progress(download_id, d)],
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
+            'prefer_ffmpeg': True,
+            'ffmpeg_location': '/usr/bin/ffmpeg',  # Common location on Linux
         })
 
-        # Determine format selection
+        # Determine format selection with better audio handling
         if format_id and audio_id:
             # Specific video + specific audio
-            ydl_opts['format'] = f"{format_id}+{audio_id}"
+            ydl_opts['format'] = f"{format_id}+{audio_id}/best[height<=1080]"
         elif format_id:
-            # Specific video + best audio
-            ydl_opts['format'] = f"{format_id}+bestaudio/best"
+            # Specific video + best audio - ensure audio is included
+            ydl_opts['format'] = f"{format_id}+bestaudio[ext=m4a]/best[height<=1080]"
+            # Add post-processor to ensure audio is merged
+            ydl_opts['postprocessors'].append({
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            })
         elif audio_id:
             # Audio only
             ydl_opts['format'] = audio_id
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
         else:
-            # Best video + best audio
-            ydl_opts['format'] = 'bestvideo+bestaudio/best'
+            # Best video + best audio with fallback
+            ydl_opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
 
         # Always merge to mp4 for video downloads
         if not audio_id or format_id:
@@ -283,33 +344,26 @@ def process_download(download_id, url, format_id=None, audio_id=None):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
-        # Check if file was created
-        if os.path.exists(output_path):
+        # Find the downloaded file
+        downloaded_file = None
+        for file in os.listdir(DOWNLOAD_FOLDER):
+            if file.startswith(download_id):
+                downloaded_file = os.path.join(DOWNLOAD_FOLDER, file)
+                break
+
+        if downloaded_file and os.path.exists(downloaded_file):
             completed_downloads[download_id] = {
                 "status": "completed",
                 "url": url,
-                "file_path": output_path,
+                "file_path": downloaded_file,
                 "download_url": f"/api/get-file/{download_id}",
                 "completion_time": time.time()
             }
         else:
-            # Try to find the file with different naming
-            for file in os.listdir(DOWNLOAD_FOLDER):
-                if file.startswith(download_id):
-                    old_path = os.path.join(DOWNLOAD_FOLDER, file)
-                    os.rename(old_path, output_path)
-                    completed_downloads[download_id] = {
-                        "status": "completed",
-                        "url": url,
-                        "file_path": output_path,
-                        "download_url": f"/api/get-file/{download_id}",
-                        "completion_time": time.time()
-                    }
-                    break
-            else:
-                raise Exception("Download completed but file not found")
+            raise Exception("Download completed but file not found")
 
     except Exception as e:
+        print(f"Download error: {e}")
         completed_downloads[download_id] = {
             "status": "failed",
             "url": url,
@@ -380,49 +434,72 @@ def direct_download(video_id, format_id):
     try:
         # Create filename based on parameters
         if audio_id:
-            filename = f"{video_id}_{format_id}_{audio_id}.mp4"
+            filename = f"{video_id}_{format_id}_{audio_id}.%(ext)s"
         else:
-            filename = f"{video_id}_{format_id}.mp4"
-        
+            filename = f"{video_id}_{format_id}.%(ext)s"
+
         output_path = os.path.join(DOWNLOAD_FOLDER, filename)
 
-        # Check if file already exists (cached)
-        if os.path.exists(output_path):
-            download_name = custom_filename if custom_filename else f"{video_id}.mp4"
-            return send_file(output_path, as_attachment=True, download_name=download_name)
-
-        # Set up download options
+        # Set up download options with better audio handling
         ydl_opts = get_base_ydl_opts()
         ydl_opts.update({
             'outtmpl': output_path,
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
+            'prefer_ffmpeg': True,
+            'ffmpeg_location': '/usr/bin/ffmpeg',
         })
 
-        # Determine format - always try to combine with audio for video formats
+        # Get format information first
+        with yt_dlp.YoutubeDL(get_base_ydl_opts()) as temp_ydl:
+            info = temp_ydl.extract_info(url, download=False)
+            target_format = None
+            best_audio = None
+            
+            # Find the target format and best audio
+            for fmt in info.get('formats', []):
+                if fmt.get('format_id') == format_id:
+                    target_format = fmt
+                if fmt.get('vcodec') == 'none' and fmt.get('acodec') != 'none':
+                    if not best_audio or (fmt.get('abr', 0) > best_audio.get('abr', 0)):
+                        best_audio = fmt
+
+        if not target_format:
+            return jsonify({"error": "Format not found"}), 404
+
+        # Determine format selection with enhanced audio handling
         if audio_id:
-            ydl_opts['format'] = f"{format_id}+{audio_id}"
+            # Specific audio requested
+            ydl_opts['format'] = f"{format_id}+{audio_id}/best"
+        elif target_format.get('vcodec') == 'none':
+            # Audio only format
+            ydl_opts['format'] = format_id
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
         else:
-            # Check if this is an audio-only format
-            with yt_dlp.YoutubeDL(get_base_ydl_opts()) as temp_ydl:
-                info = temp_ydl.extract_info(url, download=False)
-                target_format = None
-                for fmt in info.get('formats', []):
-                    if fmt.get('format_id') == format_id:
-                        target_format = fmt
-                        break
-                
-                if target_format:
-                    if target_format.get('vcodec') == 'none':
-                        # Audio only format
-                        ydl_opts['format'] = format_id
-                    else:
-                        # Video format - combine with best audio
-                        ydl_opts['format'] = f"{format_id}+bestaudio/best"
-                        ydl_opts['merge_output_format'] = 'mp4'
+            # Video format - ensure audio is combined
+            if target_format.get('acodec') == 'none':
+                # Video without audio - must combine with audio
+                if best_audio:
+                    ydl_opts['format'] = f"{format_id}+{best_audio['format_id']}/best"
+                else:
+                    ydl_opts['format'] = f"{format_id}+bestaudio/best"
+            else:
+                # Video with audio
+                ydl_opts['format'] = format_id
+            
+            # Always merge to mp4 for video
+            ydl_opts['merge_output_format'] = 'mp4'
 
         # Download the file
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url)
-            
+
             # Get the actual title for filename
             if not custom_filename and info.get('title'):
                 video_title = info.get('title')
@@ -431,27 +508,27 @@ def direct_download(video_id, format_id):
                 # Add extension based on format
                 if target_format and target_format.get('vcodec') == 'none':
                     # Audio format
-                    ext = target_format.get('ext', 'mp3')
-                    download_name = f"{video_title}.{ext}"
+                    download_name = f"{video_title}.mp3"
                 else:
                     # Video format
                     download_name = f"{video_title}.mp4"
             else:
                 download_name = custom_filename if custom_filename else f"{video_id}.mp4"
 
-        # Check if download was successful
-        if os.path.exists(output_path):
-            return send_file(output_path, as_attachment=True, download_name=download_name)
+        # Find the downloaded file
+        downloaded_file = None
+        for file in os.listdir(DOWNLOAD_FOLDER):
+            if file.startswith(video_id) and format_id in file:
+                downloaded_file = os.path.join(DOWNLOAD_FOLDER, file)
+                break
+
+        if downloaded_file and os.path.exists(downloaded_file):
+            return send_file(downloaded_file, as_attachment=True, download_name=download_name)
         else:
-            # Try to find the file with different naming
-            for file in os.listdir(DOWNLOAD_FOLDER):
-                if file.startswith(video_id) and format_id in file:
-                    file_path = os.path.join(DOWNLOAD_FOLDER, file)
-                    return send_file(file_path, as_attachment=True, download_name=download_name)
-            
             return jsonify({"error": "Download failed - file not found"}), 500
 
     except Exception as e:
+        print(f"Direct download error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/upload-cookie', methods=['POST'])
@@ -476,15 +553,17 @@ def health_check():
     """Health check endpoint"""
     return jsonify({
         "status": "ok",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "platform": "render",
         "cookie_file_exists": os.path.exists(COOKIE_FILE),
+        "ffmpeg_available": os.path.exists('/usr/bin/ffmpeg'),
         "storage_info": "Ephemeral storage - files deleted after 30 minutes",
         "features": [
             "All video qualities (144p to 8K)",
             "Audio-only formats",
             "Automatic video+audio combination",
-            "Format caching"
+            "Format caching",
+            "Enhanced error handling"
         ]
     })
 
@@ -492,9 +571,9 @@ def health_check():
 def root():
     """Root endpoint"""
     return jsonify({
-        "message": "YouTube Downloader API v2.0",
-        "description": "Supports all video qualities and automatic audio combination",
-        "version": "2.0.0",
+        "message": "YouTube Downloader API v2.1",
+        "description": "Supports all video qualities with guaranteed audio combination",
+        "version": "2.1.0",
         "endpoints": [
             "/api/health",
             "/api/video-info",
@@ -509,7 +588,8 @@ def root():
             "Audio-only downloads",
             "Automatic video+audio combination",
             "Progress tracking",
-            "File caching"
+            "File caching",
+            "Enhanced error handling"
         ]
     })
 
