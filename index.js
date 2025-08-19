@@ -27,13 +27,48 @@ const downloadRequests = new Map();
 
 // Helper function to extract video ID from YouTube URL
 const extractVideoId = (url) => {
-  const regex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
-  const match = url.match(regex);
-  return match ? match[1] : null;
+  // Handle various YouTube URL formats including Shorts
+  const patterns = [
+    // Standard YouTube URLs
+    /(?:youtube\.com\/watch\?v=)([^&\n?#]+)/,
+    // YouTube embed URLs
+    /(?:youtube\.com\/embed\/)([^&\n?#]+)/,
+    // YouTube mobile URLs
+    /(?:m\.youtube\.com\/watch\?v=)([^&\n?#]+)/,
+    // YouTube Shorts URLs
+    /(?:youtube\.com\/shorts\/)([^&\n?#]+)/,
+    // Shortened youtu.be URLs
+    /(?:youtu\.be\/)([^&\n?#]+)/,
+    // YouTube live URLs
+    /(?:youtube\.com\/live\/)([^&\n?#]+)/,
+    // YouTube watch URLs with additional parameters
+    /(?:youtube\.com\/.*[?&]v=)([^&\n?#]+)/
+  ];
+
+  // Try each pattern until we find a match
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match && match[1]) {
+      // Ensure the video ID is exactly 11 characters (YouTube standard)
+      const videoId = match[1];
+      if (videoId.length === 11) {
+        return videoId;
+      }
+    }
+  }
+
+  return null;
 };
 
 // Helper function to validate YouTube URL
 const validateYouTubeURL = (url) => {
+  // First check if it's a YouTube domain
+  const youtubePattern = /^https?:\/\/(www\.)?(youtube\.com|youtu\.be|m\.youtube\.com)/;
+  if (!youtubePattern.test(url)) {
+    return false;
+  }
+
+  // Then check if we can extract a valid video ID
   return extractVideoId(url) !== null;
 };
 
